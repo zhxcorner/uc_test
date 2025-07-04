@@ -29,7 +29,7 @@ model = DualBranchVSSM(
     num_classes=num_classes,
     fusion_levels=[0, 1, 2],
     fusion_mode='gate',
-    edge_attention='cbam'  # or 'none'
+    edge_attention='none'  # or 'none'
 ).to(device)
 model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
