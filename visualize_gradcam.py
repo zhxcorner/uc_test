@@ -9,8 +9,17 @@ from torchvision import transforms
 from PIL import Image
 from MedMamba import DualBranchVSSM
 
+import argparse
+
+parser = argparse.ArgumentParser(description='Test a trained model from log directory.')
+parser.add_argument('--log_dir', type=str, required=True,
+                    help='Path to the log directory containing config.json and best.pth')
+
+args = parser.parse_args()
+
+
 # === Settings ===
-model_path = '/MedMamba/logs/20250618-100001/UCNet_best.pth'
+model_path = os.path.join(args.log_dir, '/UCNet_best.pth')
 val_path = '/data/单个细胞分类数据集二分类S2L/val'
 output_dir = './gradcam_output'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
