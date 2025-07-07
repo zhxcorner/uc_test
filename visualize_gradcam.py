@@ -34,6 +34,8 @@ model = DualBranchVSSM(
 model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
 
+for name, module in model.named_modules():
+    print(f"{name} -> {module}")
 # === Hook Setup ===
 features = []
 gradients = []
