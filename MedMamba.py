@@ -1206,7 +1206,7 @@ class VSSMEdgeEnhanced(nn.Module):
                 fuser_idx = self.fusion_levels.index(i)
                 edge_input = saved_edges[fuser_idx]
 
-                # ✅ 不再插值，因为 shape 已匹配
+                # 不再插值，因为 shape 已匹配
                 x_nchw = self.fusers[fuser_idx]([x_nchw, edge_input])
 
             # NCHW -> NHWC
