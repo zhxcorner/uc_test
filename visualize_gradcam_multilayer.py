@@ -69,10 +69,8 @@ def get_gradient(name):
     return hook
 
 # Layer names and modules
-target_layer_names = ["sobel_conv_x", "sobel_conv_y", "edge_conv0", "edge_conv1", "edge_conv2"]
+target_layer_names = ["edge_conv0", "edge_conv1", "edge_conv2"]
 target_layers = [
-    model.edge_extractor.sobel_conv_x,
-    model.edge_extractor.sobel_conv_y,
     model.edge_convs[0].conv,
     model.edge_convs[1].conv,
     model.edge_convs[2].conv,

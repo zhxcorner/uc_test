@@ -965,6 +965,113 @@ class DualBranchVSSM(nn.Module):
         x = torch.flatten(x, 1)
         return self.head(x)
 
+class DualBranchVSSMEnhanced(nn.Module):
+    """
+    VSSM + Input-Edge 分支：
+    1) 在原始输入图像上用 Sobel 提取边缘
+    2) 对边缘特征按 patch_size*2^i 下采样到各个阶段分辨率
+    3) 用 1×1 卷积映射到与每个阶段通道数相同
+    4) 与主干特征逐层融合（可选 attention）
+    """
+    def __init__(
+        self,
+        patch_size=4,
+        in_chans=3,
+        num_classes=1000,
+        depths=[2,2,4,2],
+        dims=[96,192,384,768],
+        d_state=16,
+        drop_rate=0.,
+        attn_drop_rate=0.,
+        drop_path_rate=0.1,
+        norm_layer=nn.LayerNorm,
+        patch_norm=True,
+        use_checkpoint=False,
+
+        # 🔥 新增参数
+        fusion_levels=[0,1,2],        # 要融合的阶段索引，范围 [0, num_layers-1]
+        edge_attention='none',         # 融合时的 attention 类型：'none'|'se'|'cbam'
+        fusion_mode='concat',
+        **kwargs
+    ):
+        super().__init__()
+        self.num_layers = len(depths)
+        self.dims = dims
+        self.patch_size = patch_size
+        self.fusion_levels = sorted(fusion_levels)
+        # —— 主干（同 VSSM） ——
+        # patch 嵌入
+        self.patch_embed = PatchEmbed2D(
+            patch_size=patch_size, in_chans=in_chans,
+            embed_dim=dims[0],
+            norm_layer=norm_layer if patch_norm else None
+        )
+        # drop & 层列表
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        self.layers = nn.ModuleList()
+        for i, depth in enumerate(depths):
+            self.layers.append(
+                VSSLayer(
+                    dim=dims[i], depth=depth, d_state=d_state,
+                    drop=drop_rate, attn_drop=attn_drop_rate,
+                    drop_path=dpr[sum(depths[:i]):sum(depths[:i+1])],
+                    norm_layer=norm_layer,
+                    downsample=PatchMerging2D if i < self.num_layers-1 else None,
+                    use_checkpoint=use_checkpoint
+                )
+            )
+        # 分类头
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Linear(dims[-1], num_classes) if num_classes>0 else nn.Identity()
+
+        # —— 输入边缘分支 ——
+        self.edge_generator = MultiScaleEdgeInfoGenerator(in_chans, [dims[i] for i in self.fusion_levels])
+
+        # 3) 融合模块：同 VSSMEdgeEnhanced 中的 ConvEdgeFusion
+        self.fusers = nn.ModuleList()
+        for lvl in self.fusion_levels:
+            C = dims[lvl]
+            # 输入特征和边缘特征通道均为 C
+            self.fusers.append(build_fuser(fusion_mode, [C, C], C, attention=edge_attention))
+
+        # 权重初始化
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_backbone(self, x):
+        # x: [B, C, H, W]
+        # —— 先生成各阶段的边缘特征 ——
+        edge_feats = self.edge_generator(x)
+        # —— 主干 forward ——
+        x = self.patch_embed(x)      # [B, H/ps, W/ps, dims[0]]
+        x = self.pos_drop(x)
+        for i, layer in enumerate(self.layers):
+            # NCHW 转换
+            x_nchw = x.permute(0,3,1,2).contiguous()
+            if i in self.fusion_levels:
+                idx = self.fusion_levels.index(i)
+                xe = edge_feats[idx]
+                # 将边缘特征融合到主干特征
+                x_nchw = self.fusers[idx]([x_nchw, xe])
+            # NCHW -> NHWC
+            x = layer(x_nchw.permute(0,2,3,1).contiguous())
+        return x
+
+    def forward(self, x):
+        x = self.forward_backbone(x)      # [B, H', W', C']
+        x = x.permute(0,3,1,2)            # [B, C', H', W']
+        x = self.avgpool(x)               # [B, C', 1, 1]
+        x = torch.flatten(x, 1)
+        return self.head(x)
+
 class VSSMEdgeEnhanced(nn.Module):
     def __init__(
         self,

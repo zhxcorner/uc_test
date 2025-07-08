@@ -15,12 +15,14 @@ from tqdm import tqdm
 from MedMamba import VSSM as vssm
 from MedMamba import VSSMEdgeEnhanced as edge_enhanced
 from MedMamba import DualBranchVSSM as dual_branch
+from MedMamba import DualBranchVSSMEnhanced as dual_branch_enhanced
 
 # 模型字典
 MODEL_MAP = {
     'vssm': vssm,
     'edge_enhanced': edge_enhanced,
-    'dual_branch': dual_branch
+    'dual_branch': dual_branch,
+    'dual_branch_enhanced': dual_branch_enhanced,
 }
 
 def setup_logger_and_saver(model_name="UC"):
@@ -133,7 +135,7 @@ def main():
             'edge_attention': args.edge_attention,
             'fusion_mode': args.fusion_mode,
         })
-    elif args.model_type == 'dual_branch':
+    elif args.model_type == 'dual_branch' or args.model_type == 'dual_branch_enhanced':
         model_kwargs.update({
             'fusion_levels': args.fusion_levels,
             'edge_attention': args.edge_attention,
