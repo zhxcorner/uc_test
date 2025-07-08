@@ -7,10 +7,10 @@ from PIL import Image
 from torchvision import transforms
 import argparse
 
+# 解析参数
 parser = argparse.ArgumentParser(description='Test a trained model from log directory.')
 parser.add_argument('--log_dir', type=str, required=True,
                     help='Path to the log directory containing config.json and best.pth')
-
 args = parser.parse_args()
 
 # === Settings ===
@@ -40,30 +40,38 @@ model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
 
 # === Hook Setup for Multiple Layers ===
-features_list = []
-gradients_list = []
+features = {}
+gradients = {}
 
-def forward_hook(module, input, output):
-    features_list.append(output.detach())
+def get_activation(name):
+    def hook(module, input, output):
+        features[name] = output.detach()
+    return hook
 
-def backward_hook(module, grad_input, grad_output):
-    gradients_list.append(grad_output[0].detach())
+def get_gradient(name):
+    def hook(module, grad_input, grad_output):
+        gradients[name] = grad_output[0].detach()
+    return hook
 
-# Register hooks on multiple layers of the left branch
+# Layer names and modules
+target_layer_names = ["edge_conv0", "edge_conv1", "edge_conv2"]
 target_layers = [
     model.edge_convs[0].conv,
     model.edge_convs[1].conv,
     model.edge_convs[2].conv,
 ]
 
-for layer in target_layers:
-    layer.register_forward_hook(forward_hook)
-    layer.register_full_backward_hook(backward_hook)
+# Register hooks
+hooks = []
+for name, layer in zip(target_layer_names, target_layers):
+    hooks.append(layer.register_forward_hook(get_activation(name)))
+    hooks.append(layer.register_full_backward_hook(get_gradient(name)))
 
 # === Helper to apply Grad-CAM ===
 def generate_cams(image_tensor, class_idx):
-    features_list.clear()
-    gradients_list.clear()
+    global features, gradients
+    features = {}
+    gradients = {}
 
     image_tensor = image_tensor.unsqueeze(0).to(device)
     output = model(image_tensor)
@@ -73,24 +81,20 @@ def generate_cams(image_tensor, class_idx):
     output[0, class_idx].backward()
 
     cam_maps = []
-    for i in range(len(target_layers)):
-        # Get feature map and gradients for this layer
-        fmap = features_list[i].squeeze(0)  # shape: [C, H, W]
-        grads = gradients_list[i].squeeze(0)  # shape: [C, H, W]
+    for name in target_layer_names:
+        fmap = features[name].squeeze(0)     # shape: [C, H, W]
+        grad = gradients[name].squeeze(0)    # shape: [C, H, W]
 
-        # Compute global average pool of gradients (channel-wise weights)
-        weights = grads.mean(dim=(1, 2))  # shape: [C]
-
-        # Weighted sum over channels
-        cam = torch.sum(weights[:, None, None] * fmap, dim=0)  # now C matches
+        weights = grad.mean(dim=(1, 2))      # shape: [C]
+        cam = (weights[:, None, None] * fmap).sum(dim=0)
         cam = F.relu(cam)
-        cam = cam - cam.min()
-        cam = cam / (cam.max() + 1e-8)
+        cam = (cam - cam.min()) / (cam.max() + 1e-8)
         cam_np = cam.cpu().numpy()
         cam_np = cv2.resize(cam_np, (img_size, img_size))
         cam_maps.append(cam_np)
 
     return cam_maps, pred
+
 # === Overlay CAM on image ===
 def overlay_cam(image_path, cam_map):
     image = Image.open(image_path).convert('RGB').resize((img_size, img_size))
