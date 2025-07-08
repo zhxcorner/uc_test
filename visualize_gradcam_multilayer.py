@@ -28,6 +28,21 @@ transform = transforms.Compose([
     transforms.Normalize((0.5,)*3, (0.5,)*3)
 ])
 
+
+def sobel_edge_detection(image_path):
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    image = cv2.resize(image, (img_size, img_size))
+
+    grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
+    edge = cv2.magnitude(grad_x, grad_y)
+    edge = (edge / edge.max()) * 255
+    edge_map = np.uint8(edge)
+
+    # 转换为三通道便于拼接
+    edge_map = cv2.cvtColor(edge_map, cv2.COLOR_GRAY2RGB)
+    return edge_map
+
 # === Load Model ===
 from MedMamba import DualBranchVSSM
 model = DualBranchVSSM(
@@ -121,15 +136,24 @@ for cls_name in class_dirs:
         image = Image.open(img_path).convert("RGB")
         input_tensor = transform(image)
 
+        # 在 for 循环内找到下面这段代码：
         cam_maps, pred = generate_cams(input_tensor, class_idx)
 
-        # Generate overlays
+        # === 新增内容开始 ===
+        # 获取原始图像和 Sobel 边缘图
         base_img = Image.open(img_path).convert('RGB').resize((img_size, img_size))
         base_np = np.array(base_img)
+
+        # 生成 Sobel 边缘图
+        sobel_map = sobel_edge_detection(img_path)
+
+        # 生成 CAM 的 overlay 图像
         cam_overlays = [overlay_cam(img_path, cam) for cam in cam_maps]
 
-        # Concatenate images horizontally: original | cam1 | cam2 | cam3
-        combined = np.hstack([base_np] + cam_overlays)
+        # 插入 Sobel 图像到第1个位置（索引为1）
+        combined_images = [base_np, sobel_map] + cam_overlays
+        combined = np.hstack(combined_images)
+        # === 新增内容结束 ===
 
         save_path = os.path.join(save_dir, f'cam_{cls_name}_{i:03d}.jpg')
         cv2.imwrite(save_path, cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
