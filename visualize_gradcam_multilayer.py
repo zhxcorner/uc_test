@@ -74,10 +74,15 @@ def generate_cams(image_tensor, class_idx):
 
     cam_maps = []
     for i in range(len(target_layers)):
-        fmap = features_list[i].squeeze(0)
-        grads = gradients_list[i].squeeze(0)
-        weights = grads.mean(dim=(1, 2))
-        cam = torch.sum(weights[:, None, None] * fmap, dim=0)
+        # Get feature map and gradients for this layer
+        fmap = features_list[i].squeeze(0)  # shape: [C, H, W]
+        grads = gradients_list[i].squeeze(0)  # shape: [C, H, W]
+
+        # Compute global average pool of gradients (channel-wise weights)
+        weights = grads.mean(dim=(1, 2))  # shape: [C]
+
+        # Weighted sum over channels
+        cam = torch.sum(weights[:, None, None] * fmap, dim=0)  # now C matches
         cam = F.relu(cam)
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-8)
@@ -86,7 +91,6 @@ def generate_cams(image_tensor, class_idx):
         cam_maps.append(cam_np)
 
     return cam_maps, pred
-
 # === Overlay CAM on image ===
 def overlay_cam(image_path, cam_map):
     image = Image.open(image_path).convert('RGB').resize((img_size, img_size))
