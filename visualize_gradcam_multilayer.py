@@ -5,11 +5,18 @@ import numpy as np
 import os
 from PIL import Image
 from torchvision import transforms
+import argparse
+
+parser = argparse.ArgumentParser(description='Test a trained model from log directory.')
+parser.add_argument('--log_dir', type=str, required=True,
+                    help='Path to the log directory containing config.json and best.pth')
+
+args = parser.parse_args()
 
 # === Settings ===
 model_path = os.path.join(args.log_dir, 'UCNet_best.pth')
-val_path = '/data/单个细胞分类数据集二分类S2L/val'
-output_dir = './gradcam_output'
+val_path = '/data/单个细胞分类数据集二分类S2L/train'
+output_dir = '../gradcam_output_multilayer'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 img_size = 224
 num_classes = 2
