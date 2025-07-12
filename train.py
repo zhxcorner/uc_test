@@ -65,7 +65,7 @@ def evaluate_model(model, data_loader, device, dataset_size):
 def main():
     parser = argparse.ArgumentParser(description="Train MedMamba Model with Model Selection and Edge Fusion Options")
     parser.add_argument('--model_type', type=str, required=True,
-                        choices=['vssm', 'edge_enhanced', 'dual_branch'],
+                        choices=['vssm', 'edge_enhanced', 'dual_branch', 'dual_branch_enhanced'],
                         help='Type of model to use')
     parser.add_argument('--num_classes', type=int, default=2,
                         help='Number of output classes (default: 2)')
