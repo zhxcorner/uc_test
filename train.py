@@ -142,7 +142,10 @@ def main():
             'fusion_mode': args.fusion_mode, 
         })
 
-    net = model_class(num_classes=args.num_classes, **model_kwargs).to(device)
+    net = model_class(depths=[2, 2, 4, 2],
+                      dims=[96,192,384,768],
+                      num_classes=args.num_classes,
+                      **model_kwargs).to(device)
     loss_function = nn.CrossEntropyLoss()
     optimizer = optim.Adam(net.parameters(), lr=0.0001)
 

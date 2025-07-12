@@ -1026,7 +1026,7 @@ class DualBranchVSSMEnhanced(nn.Module):
         self.head = nn.Linear(dims[-1], num_classes) if num_classes>0 else nn.Identity()
 
         # —— 输入边缘分支 ——
-        self.edge_generator = MultiScaleEdgeInfoGenerator(in_chans, [dims[i] for i in self.fusion_levels])
+        self.edge_generator = MultiScaleEdgeInfoGenerator_422(in_chans, [dims[i] for i in self.fusion_levels])
 
         # 3) 融合模块：同 VSSMEdgeEnhanced 中的 ConvEdgeFusion
         self.fusers = nn.ModuleList()
@@ -1049,9 +1049,8 @@ class DualBranchVSSMEnhanced(nn.Module):
     def forward_backbone(self, x):
         # x: [B, C, H, W]
         # —— 先生成各阶段的边缘特征 ——
-        edge_feats = self.edge_generator(x)
-        for edge_feat in edge_feats:
-            print(edge_feat.shape)
+        with torch.no_grad():
+            edge_feats = self.edge_generator(x)
         # —— 主干 forward ——
         x = self.patch_embed(x)      # [B, H/ps, W/ps, dims[0]]
         x = self.pos_drop(x)
@@ -1223,6 +1222,8 @@ class VSSMEdgeEnhanced(nn.Module):
         x = torch.flatten(x, 1)
         x = self.head(x)
         return x
+
+
 
 class VSSM(nn.Module):
     def __init__(self, patch_size=4, in_chans=3, num_classes=1000, depths=[2, 2, 4, 2], depths_decoder=[2, 9, 2, 2],

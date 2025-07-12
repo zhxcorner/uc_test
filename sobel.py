@@ -93,13 +93,42 @@ class MultiScaleEdgeInfoGenerator(nn.Module):
         self.conv_1x1s = nn.ModuleList(Conv(inc, ouc, 1) for ouc in oucs)
 
     def forward(self, x):
-        edge = self.sc(x)  # [B, C, 224, 224]
+        outputs = [self.sc(x)]
+        outputs.extend(self.maxpool(outputs[-1]) for _ in self.conv_1x1s)
+        outputs = outputs[1:]
+        for i in range(len(self.conv_1x1s)):
+            outputs[i] = self.conv_1x1s[i](outputs[i])
+        return outputs
+
+class MultiScaleEdgeInfoGenerator_422(nn.Module):
+    def __init__(self, inc, oucs) -> None:
+        super().__init__()
+
+        self.sc = SobelConv(inc)
+        self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv_1x1s = nn.ModuleList(Conv(inc, ouc, 1) for ouc in oucs)
+
+    def forward(self, x):
+        edge = self.sc(x)  # 原始边缘特征 (B, C, H, W)
+
         outputs = []
-        for conv in self.conv_1x1s:
-            edge = self.maxpool(edge)  # 每次都下采样
-            out = conv(edge)  # 投影到正确维度
-            outputs.append(out)
-        return outputs  # 返回列表：[B, C_i, H_i, W_i]
+
+        # 🔽 第一个输出：下采样4倍（MaxPool两次）
+        x_down = self.maxpool(edge)  # H/2
+        x_down = self.maxpool(x_down)  # H/4
+        outputs.append(x_down)
+
+        # 🔁 后续输出：在前一个基础上继续下采样
+        for _ in range(len(self.conv_1x1s) - 1):
+            x_down = self.maxpool(x_down)
+            outputs.append(x_down)
+
+        # 每个下采样特征通过对应的 1x1 卷积降维
+        for i in range(len(self.conv_1x1s)):
+            outputs[i] = self.conv_1x1s[i](outputs[i])
+
+        return outputs
+
 
 class SE(nn.Module):
     def __init__(self, channel, reduction=16):
