@@ -1050,6 +1050,8 @@ class DualBranchVSSMEnhanced(nn.Module):
         # x: [B, C, H, W]
         # —— 先生成各阶段的边缘特征 ——
         edge_feats = self.edge_generator(x)
+        for edge_feat in edge_feats:
+            print(edge_feat.shape)
         # —— 主干 forward ——
         x = self.patch_embed(x)      # [B, H/ps, W/ps, dims[0]]
         x = self.pos_drop(x)

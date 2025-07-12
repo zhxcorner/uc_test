@@ -44,15 +44,15 @@ class SobelConv(nn.Module):
         sobel_y = np.array([[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=np.float32)
         sobel_x = sobel_y.T  # 横向
 
-        # 转成 tensor，shape �?(1, 1, 3, 3)
+        # 转成 tensor，shape �?(1, 1, 3, 3)
         kernel_y = torch.tensor(sobel_y).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 3]
         kernel_x = torch.tensor(sobel_x).unsqueeze(0).unsqueeze(0)
 
-        # 扩展为每个通道独立卷积�?(C, 1, 3, 3)
+        # 扩展为每个通道独立卷积�?(C, 1, 3, 3)
         kernel_y = kernel_y.repeat(channel, 1, 1, 1)  # shape: (C, 1, 3, 3)
         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
 
-        # 定义 depthwise Conv2d（每个通道单独卷积�?
+        # 定义 depthwise Conv2d（每个通道单独卷积�?
         self.sobel_conv_y = nn.Conv2d(
             in_channels=channel,
             out_channels=channel,
@@ -88,17 +88,18 @@ class MultiScaleEdgeInfoGenerator(nn.Module):
         super().__init__()
 
         self.sc = SobelConv(inc)
-        # 下采�?
+        # 下采�?
         self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.conv_1x1s = nn.ModuleList(Conv(inc, ouc, 1) for ouc in oucs)
 
     def forward(self, x):
-        outputs = [self.sc(x)]
-        outputs.extend(self.maxpool(outputs[-1]) for _ in self.conv_1x1s)
-        outputs = outputs[1:]
-        for i in range(len(self.conv_1x1s)):
-            outputs[i] = self.conv_1x1s[i](outputs[i])
-        return outputs
+        edge = self.sc(x)  # [B, C, 224, 224]
+        outputs = []
+        for conv in self.conv_1x1s:
+            edge = self.maxpool(edge)  # 每次都下采样
+            out = conv(edge)  # 投影到正确维度
+            outputs.append(out)
+        return outputs  # 返回列表：[B, C_i, H_i, W_i]
 
 class SE(nn.Module):
     def __init__(self, channel, reduction=16):
@@ -194,7 +195,7 @@ class ConvEdgeFusion(nn.Module):
         self.conv_1x1 = Conv(ouc // 2, ouc, 1)
 
     def forward(self, x_list):
-        x = torch.cat(x_list, dim=1)  # 拼接输入特征�?
+        x = torch.cat(x_list, dim=1)  # 拼接输入特征�?
         x = self.attention(x)
         x = self.conv_channel_fusion(x)
         x = self.conv_3x3_feature_extract(x)
@@ -206,7 +207,7 @@ class ConvEdgeFusion1(nn.Module):
         super().__init__()
         self.attention_type = attention.lower()
 
-        # 可选的分支归一�?
+        # 可选的分支归一�?
         self.edge_proj = Conv(inc[0], inc[0], k=3)
         self.backbone_proj = Conv(inc[1], inc[1], k=3)
 
@@ -224,7 +225,7 @@ class ConvEdgeFusion1(nn.Module):
         else:
             self.attention = nn.Identity()
 
-        # 最终输�?
+        # 最终输�?
         self.final_conv = Conv(ouc, ouc, k=1)
 
     def forward(self, x_list):
@@ -235,11 +236,11 @@ class ConvEdgeFusion1(nn.Module):
         # 拼接融合
         x = torch.cat([edge_feat, backbone_feat], dim=1)
 
-        # 融合与特征提�?
+        # 融合与特征提�?
         x = self.conv_channel_fusion(x)
         x = self.conv_3x3(x)
 
-        # 应用注意�?
+        # 应用注意�?
         x = self.attention(x)
 
         # 输出
@@ -293,7 +294,7 @@ class GatedConvEdgeFusion(nn.Module):
         )
 
     def forward(self, inputs):
-        # �?支持 list / tuple 输入
+        # �?支持 list / tuple 输入
         if isinstance(inputs, (list, tuple)):
             main_feat, edge_feat = inputs
         main_feat = self.align_main(main_feat)
@@ -316,7 +317,7 @@ class GatedConvEdgeFusion(nn.Module):
             out = self.attn(fusion_input)
 
         elif self.mode == 'transformer':
-            # Reshape to sequence: [B, C, H, W] �?[B, HW, C]
+            # Reshape to sequence: [B, C, H, W] �?[B, HW, C]
             seq = (main_feat + edge_feat).flatten(2).permute(0, 2, 1)
             seq = self.transformer(seq)
             out = seq.permute(0, 2, 1).view(B, C, H, W)
@@ -378,7 +379,7 @@ class DualPathEdgeFusion(nn.Module):
             raise ValueError(f"Unsupported fusion mode: {self.mode}")
 
     def forward(self, inputs):
-        # �?支持 list / tuple 输入
+        # �?支持 list / tuple 输入
         if isinstance(inputs, (list, tuple)):
             main_feat, edge_feat = inputs
         # Align dimensions
