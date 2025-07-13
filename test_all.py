@@ -13,7 +13,8 @@ from sobel import *
 MODEL_MAP = {
     'vssm': vssm,
     'edge_enhanced': edge_enhanced,
-    'dual_branch': dual_branch
+    'dual_branch': dual_branch,
+    'dual_branch_enhanced': dual_branch_enhanced,
 }
 
 def evaluate_model(model, data_loader, device, dataset_size):
@@ -62,7 +63,7 @@ def load_config_and_test_model(log_dir):
             'edge_attention': config.get('edge_attention'),
             'fusion_mode': config.get('fusion_mode', 'concat')
         })
-    elif model_type == 'dual_branch':
+    elif model_type == 'dual_branch' or model_type == 'dual_branch_enhanced':
         model_kwargs.update({
             'fusion_levels': config.get('fusion_levels'),
             'edge_attention': config.get('edge_attention'),
