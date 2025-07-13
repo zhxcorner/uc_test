@@ -44,7 +44,8 @@ def sobel_edge_detection(image_path):
     return edge_map
 
 # === Load Model ===
-from MedMamba import DualBranchVSSM
+# from MedMamba import DualBranchVSSM
+from MedMamba import DualBranchVSSMEnhanced as DualBranchVSSM
 model = DualBranchVSSM(
     num_classes=num_classes,
     fusion_levels=[0, 1, 2],
@@ -69,11 +70,17 @@ def get_gradient(name):
     return hook
 
 # Layer names and modules
-target_layer_names = ["edge_conv0", "edge_conv1", "edge_conv2"]
+# target_layer_names = ["edge_conv0", "edge_conv1", "edge_conv2"]
+# target_layers = [
+#     model.edge_convs[0].conv,
+#     model.edge_convs[1].conv,
+#     model.edge_convs[2].conv,
+# ]
+target_layer_names = ["fusion0", "fusion1", "fusion2"]
 target_layers = [
-    model.edge_convs[0].conv,
-    model.edge_convs[1].conv,
-    model.edge_convs[2].conv,
+    model.fusers[0],
+    model.fusers[1],
+    model.fusers[2],
 ]
 
 # Register hooks
@@ -158,4 +165,4 @@ for cls_name in class_dirs:
         save_path = os.path.join(save_dir, f'cam_{cls_name}_{i:03d}.jpg')
         cv2.imwrite(save_path, cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
 
-        print(f"[{cls_name}] Saved: {save_path} | Predicted: {'LGUC' if pred == 0 else 'HGD'}")
+        print(f"[{cls_name}] Saved: {save_path} | Predicted: {'LGUC' if pred == 0 else 'HGUC'}")

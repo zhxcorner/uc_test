@@ -323,11 +323,9 @@ class GatedConvEdgeFusion(nn.Module):
         )
 
     def forward(self, inputs):
-        # �?支持 list / tuple 输入
-        if isinstance(inputs, (list, tuple)):
-            main_feat, edge_feat = inputs
-        main_feat = self.align_main(main_feat)
-        edge_feat = self.align_edge(edge_feat)
+        main_feat, edge_feat = inputs
+        # main_feat = self.align_main(main_feat)
+        # edge_feat = self.align_edge(edge_feat)
         B, C, H, W = main_feat.shape
 
         if self.mode in ['softmax', 'sigmoid']:
