@@ -27,7 +27,7 @@ MODEL_MAP = {
 
 def setup_logger_and_saver(model_name="UC"):
     current_time = time.strftime("%Y%m%d-%H%M%S")
-    log_dir = os.path.join("logs", current_time)
+    log_dir = os.path.join("../logs", current_time)
     os.makedirs(log_dir, exist_ok=True)
 
     log_file = os.path.join(log_dir, "log.txt")
