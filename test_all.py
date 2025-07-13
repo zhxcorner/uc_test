@@ -8,6 +8,7 @@ from torchvision import transforms, datasets
 from MedMamba import VSSM as vssm
 from MedMamba import VSSMEdgeEnhanced as edge_enhanced
 from MedMamba import DualBranchVSSM as dual_branch
+from MedMamba import DualBranchVSSMEnhanced as dual_branch_enhanced
 from sobel import *
 # 模型字典
 MODEL_MAP = {
