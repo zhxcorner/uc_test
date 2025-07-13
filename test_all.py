@@ -95,7 +95,7 @@ def load_config_and_test_model(log_dir):
 
 
 def main():
-    logs_dir = "logs"
+    logs_dir = "../logs"
     if not os.path.isdir(logs_dir):
         print(f"❌ Logs directory '{logs_dir}' not found.")
         return
