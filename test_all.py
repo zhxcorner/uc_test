@@ -24,9 +24,10 @@ def evaluate_model(model, data_loader, device, dataset_size):
     with torch.no_grad():
         test_bar = tqdm(data_loader, desc="Testing", leave=False)
         for images, labels in test_bar:
-            outputs = model(images.to(device))
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
             predict_y = torch.max(outputs, dim=1)[1]
-            acc += torch.eq(predict_y, labels.to(device)).sum().item()
+            acc += torch.eq(predict_y, labels).sum().item()
     return acc / dataset_size
 
 
@@ -64,12 +65,12 @@ def load_config_and_test_model(log_dir):
             'edge_attention': config.get('edge_attention'),
             'fusion_mode': config.get('fusion_mode', 'concat')
         })
-    elif model_type == 'dual_branch' or model_type == 'dual_branch_enhanced':
+    elif model_type in ['dual_branch', 'dual_branch_enhanced']:
         model_kwargs.update({
             'fusion_levels': config.get('fusion_levels'),
             'edge_attention': config.get('edge_attention'),
             'fusion_mode': config.get('fusion_mode', 'concat')
-            })
+        })
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -91,6 +92,18 @@ def load_config_and_test_model(log_dir):
 
     test_acc = evaluate_model(model, test_loader, device, len(test_dataset))
     print(f"[{log_dir}] ✅ Test Accuracy: {test_acc:.4f}")
+
+    # 将测试准确率写入 config
+    config['test_accuracy'] = round(test_acc, 4)
+
+    # 覆盖保存 config.json
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"[{log_dir}] 📝 Test accuracy saved to config.json")
+    except Exception as e:
+        print(f"[{log_dir}] ❌ Failed to write test accuracy to config: {e}")
+
     print(json.dumps(config, indent=2))
 
 
