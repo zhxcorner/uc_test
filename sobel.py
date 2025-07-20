@@ -44,15 +44,15 @@ class SobelConv(nn.Module):
         sobel_y = np.array([[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=np.float32)
         sobel_x = sobel_y.T  # 横向
 
-        # 转成 tensor，shape �?(1, 1, 3, 3)
+        # 转成 tensor，shape(1, 1, 3, 3)
         kernel_y = torch.tensor(sobel_y).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 3]
         kernel_x = torch.tensor(sobel_x).unsqueeze(0).unsqueeze(0)
 
-        # 扩展为每个通道独立卷积�?(C, 1, 3, 3)
+        # 扩展为每个通道独立卷积(C, 1, 3, 3)
         kernel_y = kernel_y.repeat(channel, 1, 1, 1)  # shape: (C, 1, 3, 3)
         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
 
-        # 定义 depthwise Conv2d（每个通道单独卷积�?
+        # 定义 depthwise Conv2d 每个通道单独卷积
         self.sobel_conv_y = nn.Conv2d(
             in_channels=channel,
             out_channels=channel,
@@ -79,7 +79,9 @@ class SobelConv(nn.Module):
     def forward(self, x):
         edge_x = self.sobel_conv_x(x)
         edge_y = self.sobel_conv_y(x)
-        edge = edge_x + edge_y
+        # edge = edge_x + edge_y
+        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)  # gradient magnitude
+
         return edge
 
 
@@ -88,7 +90,6 @@ class MultiScaleEdgeInfoGenerator(nn.Module):
         super().__init__()
 
         self.sc = SobelConv(inc)
-        # 下采�?
         self.maxpool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.conv_1x1s = nn.ModuleList(Conv(inc, ouc, 1) for ouc in oucs)
 

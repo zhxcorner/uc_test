@@ -1,44 +1,107 @@
+import os
+import json
 import torch
 import matplotlib.pyplot as plt
-import os
-import torchvision.transforms as T
+from torchvision import transforms
+from PIL import Image
 
-# 假设模型和 MultiScaleEdgeInfoGenerator_422 已定义并可用
-from MedMamba import DualBranchVSSMEnhanced
+# ✅ 模型导入
+from MedMamba import VSSM as vssm
+from MedMamba import VSSMEdgeEnhanced as edge_enhanced
+from MedMamba import DualBranchVSSM as dual_branch
+from MedMamba import DualBranchVSSMEnhanced as dual_branch_enhanced
 
-# 可选：设置图像保存目录
-SAVE_DIR = "/data/单个细胞分类数据集二分类S2L/train/HGUC/01-006-1a-20230321071302829_HGUC_0.jpg"
+# ==== 配置路径 ====
+LOG_DIR = "/root/logs/20250719-071320"
+IMAGE_PATH = '/data/单个细胞分类数据集二分类S2L/train/HGUC/01-006-1a-20230321071302829_HGUC_0.jpg'
+SAVE_DIR = "./edge_feat_visual"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# 创建模型并加载权重（如果有）
-model = DualBranchVSSMEnhanced()
+# ==== 模型类型映射 ====
+MODEL_MAP = {
+    'vssm': vssm,
+    'edge_enhanced': edge_enhanced,
+    'dual_branch': dual_branch,
+    'dual_branch_enhanced': dual_branch_enhanced,
+}
+
+# ==== 加载 config 和 best.pth ====
+config_path = os.path.join(LOG_DIR, "config.json")
+model_path = None
+for f in os.listdir(LOG_DIR):
+    if f.endswith("best.pth"):
+        model_path = os.path.join(LOG_DIR, f)
+        break
+if not model_path:
+    raise FileNotFoundError(f"No best.pth found in {LOG_DIR}")
+
+with open(config_path, 'r') as f:
+    config = json.load(f)
+
+model_type = config['model_type']
+model_class = MODEL_MAP.get(model_type)
+if model_class is None:
+    raise ValueError(f"Unknown model type: {model_type}")
+
+# ==== 构造模型结构参数 ====
+model_kwargs = {}
+if model_type == 'edge_enhanced':
+    model_kwargs.update({
+        'edge_layer_idx': config.get('edge_layer_idx'),
+        'fusion_levels': config.get('fusion_levels'),
+        'edge_attention': config.get('edge_attention'),
+        'fusion_mode': config.get('fusion_mode', 'concat')
+    })
+elif model_type in ['dual_branch', 'dual_branch_enhanced']:
+    model_kwargs.update({
+        'fusion_levels': config.get('fusion_levels'),
+        'edge_attention': config.get('edge_attention'),
+        'fusion_mode': config.get('fusion_mode', 'concat')
+    })
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = model_class(num_classes=config['num_classes'], **model_kwargs).to(device)
+model.load_state_dict(torch.load(model_path, map_location=device))
 model.eval()
 
-# 准备一个示例输入
-# 假设你有一个 RGB 图像 tensor, 形状为 [1, 3, H, W]，数值范围为 [0, 1]
-# 示例加载一张图像：
-from PIL import Image
-img = Image.open('your_image.jpg').convert('RGB')
-transform = T.Compose([
-    T.Resize((224, 224)),        # 你模型输入的尺寸
-    T.ToTensor()
+# ==== 图像加载与预处理 ====
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor()
 ])
-img_tensor = transform(img).unsqueeze(0)  # [1, 3, 224, 224]
+img = Image.open(IMAGE_PATH).convert('RGB')
+img_tensor = transform(img).unsqueeze(0).to(device)  # [1, 3, H, W]
 
-# 前向边缘分支
+# ==== 提取边缘特征并可视化（各层平均图） ====
 with torch.no_grad():
-    edge_feats = model.edge_generator(img_tensor)  # List of [B, C, H, W]
+    edge_feats = model.edge_generator(img_tensor)  # List of [1, C, H, W]
 
-# 遍历每个融合层级的边缘特征
-for lvl_idx, ef in enumerate(edge_feats):
-    B, C, H, W = ef.shape
-    for b in range(B):
-        # 可视化前几个通道（比如最多显示前 4 个）
-        for ch in range(min(C, 4)):
-            feat_map = ef[b, ch].cpu().numpy()
-            plt.imshow(feat_map, cmap='gray')
-            plt.axis('off')
-            plt.title(f"EdgeFeat L{lvl_idx} B{b} C{ch}")
-            fname = f"edge_feat_l{lvl_idx}_b{b}_c{ch}.png"
-            plt.savefig(os.path.join(SAVE_DIR, fname), bbox_inches='tight')
-            plt.close()
+for lvl_idx, feat in enumerate(edge_feats):
+    feat = feat[0]                      # [C, H, W]
+    mean_map = feat.mean(dim=0).cpu()  # [H, W]
+
+    norm_map = (mean_map - mean_map.min()) / (mean_map.max() - mean_map.min() + 1e-6)
+    norm_np = norm_map.numpy()
+
+    plt.imshow(norm_np, cmap='gray')
+    plt.axis('off')
+    plt.title(f"Edge Mean L{lvl_idx}")
+    plt.savefig(os.path.join(SAVE_DIR, f"edge_mean_l{lvl_idx}.png"), bbox_inches='tight', pad_inches=0)
+    plt.close()
+
+print(f"✅ Saved edge visualizations to: {SAVE_DIR}")
+
+# ==== 保存未经处理的 Sobel 原始边缘图（Baseline 对比） ====
+with torch.no_grad():
+    raw_sobel = model.edge_generator.sc(img_tensor)  # [1, C, H, W]
+
+# 通道平均 + Min-Max 归一化
+mean_map = raw_sobel[0].mean(dim=0).cpu()  # [H, W]
+norm_map = (mean_map - mean_map.min()) / (mean_map.max() - mean_map.min() + 1e-6)
+
+# 保存灰度图
+plt.imshow(norm_map.numpy(), cmap='gray')
+plt.axis('off')
+plt.title("Raw Sobel Output (Pre-Pooling/Conv)")
+plt.savefig(os.path.join(SAVE_DIR, "sobel_raw_mean.png"), bbox_inches='tight', pad_inches=0)
+plt.close()
