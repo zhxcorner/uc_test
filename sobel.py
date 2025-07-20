@@ -33,7 +33,13 @@ class Conv(nn.Module):
         return self.act(self.conv(x))
 
 
-
+def mask_border(x, border=1):
+    # x: Tensor of shape (B, C, H, W)
+    x[..., :border, :] = 0
+    x[..., -border:, :] = 0
+    x[..., :, :border] = 0
+    x[..., :, -border:] = 0
+    return x
 
 class SobelConv(nn.Module):
     def __init__(self, channel):
@@ -76,11 +82,16 @@ class SobelConv(nn.Module):
         self.sobel_conv_y.weight.requires_grad = False
         self.sobel_conv_x.weight.requires_grad = False
 
+
+
     def forward(self, x):
         edge_x = self.sobel_conv_x(x)
         edge_y = self.sobel_conv_y(x)
         # edge = edge_x + edge_y
-        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)  # gradient magnitude
+        edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
+
+        # ✅ 抑制边缘响应
+        edge = mask_border(edge, border=1)
 
         return edge
 
