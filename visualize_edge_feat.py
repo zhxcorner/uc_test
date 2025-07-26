@@ -12,8 +12,14 @@ from MedMamba import VSSMEdgeEnhanced as edge_enhanced
 from MedMamba import DualBranchVSSM as dual_branch
 from MedMamba import DualBranchVSSMEnhanced as dual_branch_enhanced
 
-# ==== 配置路径 ====
-LOG_DIR = "/root/logs/20250719-071320"
+import argparse
+
+# 解析参数
+parser = argparse.ArgumentParser(description='Test a trained model from log directory.')
+parser.add_argument('--log_dir', type=str, required=True,
+                    help='Path to the log directory containing config.json and best.pth')
+args = parser.parse_args()
+LOG_DIR = args.log_dir
 IMAGE_PATH = '/data/单个细胞分类数据集二分类S2L/train/HGUC/01-006-1a-20230321071302829_HGUC_0.jpg'
 BASE_SAVE_DIR = "./edge_feat_visual"
 os.makedirs(BASE_SAVE_DIR, exist_ok=True)
