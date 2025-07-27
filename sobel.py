@@ -33,71 +33,114 @@ class Conv(nn.Module):
         return self.act(self.conv(x))
 
 
-def mask_border(x, border=1):
-    # x: Tensor of shape (B, C, H, W)
-    x[..., :border, :] = 0
-    x[..., -border:, :] = 0
-    x[..., :, :border] = 0
-    x[..., :, -border:] = 0
-    return x
-
 import torch.nn.functional as F
 
-def gaussian_blur(x, kernel_size=3, sigma=1.0):
-    """Apply a simple depthwise Gaussian blur to reduce noise."""
-    # Create 1D Gaussian kernel
-    k = torch.arange(kernel_size, device=x.device, dtype=x.dtype) - kernel_size // 2
-    kernel1d = torch.exp(-0.5 * (k / sigma) ** 2)
-    kernel1d = kernel1d / kernel1d.sum()
-    kernel2d = kernel1d[:, None] @ kernel1d[None, :]
-    kernel2d = kernel2d.expand(x.size(1), 1, kernel_size, kernel_size)
-    return F.conv2d(x, kernel2d, padding=kernel_size // 2, groups=x.size(1))
+# def mask_border(x, border=1):
+#     # x: Tensor of shape (B, C, H, W)
+#     x[..., :border, :] = 0
+#     x[..., -border:, :] = 0
+#     x[..., :, :border] = 0
+#     x[..., :, -border:] = 0
+#     return x
+#
+# class SobelConv(nn.Module):
+#     def __init__(self, channel):
+#         super().__init__()
+#
+#         # Sobel 核心
+#         # sobel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float32)
+#         sobel_y = np.array([[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=np.float32)
+#         sobel_x = sobel_y.T  # 横向
+#
+#         # 转成 tensor，shape(1, 1, 3, 3)
+#         kernel_y = torch.tensor(sobel_y).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 3]
+#         kernel_x = torch.tensor(sobel_x).unsqueeze(0).unsqueeze(0)
+#
+#         # 扩展为每个通道独立卷积(C, 1, 3, 3)
+#         kernel_y = kernel_y.repeat(channel, 1, 1, 1)  # shape: (C, 1, 3, 3)
+#         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
+#
+#         # 定义 depthwise Conv2d 每个通道单独卷积
+#         self.sobel_conv_y = nn.Conv2d(
+#             in_channels=channel,
+#             out_channels=channel,
+#             kernel_size=3,
+#             padding=1,
+#             groups=channel,
+#             bias=False
+#         )
+#         self.sobel_conv_x = nn.Conv2d(
+#             in_channels=channel,
+#             out_channels=channel,
+#             kernel_size=3,
+#             padding=1,
+#             groups=channel,
+#             bias=False
+#         )
+#
+#         # 赋值并固定权重
+#         self.sobel_conv_y.weight.data = kernel_y.clone()
+#         self.sobel_conv_x.weight.data = kernel_x.clone()
+#         self.sobel_conv_y.weight.requires_grad = False
+#         self.sobel_conv_x.weight.requires_grad = False
+#
+#
+#
+#     def forward(self, x):
+#         edge_x = self.sobel_conv_x(x)
+#         edge_y = self.sobel_conv_y(x)
+#         # edge = edge_x + edge_y
+#         edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
+#
+#         # ✅ 抑制边缘响应
+#         edge = mask_border(edge, border=1)
+#
+#         return edge
 
 
 class SobelConv(nn.Module):
-    def __init__(self, channel, blur=True, blur_kernel=3, blur_sigma=1.0, edge_thr=0.2):
+    def __init__(self, channel):
         super().__init__()
-        self.apply_blur = blur
-        self.blur_kernel = blur_kernel
-        self.blur_sigma = blur_sigma
-        self.edge_thr = edge_thr
+        self.use_reflect = use_reflect
+        self.normalize = normalize
+        self.mask = mask
 
-        sobel_y = np.array([[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=np.float32)
+        # 标准 Sobel 卷积核
+        sobel_y = np.array([[1, 2, 1],
+                            [0, 0, 0],
+                            [-1, -2, -1]], dtype=np.float32)
         sobel_x = sobel_y.T
 
-        kernel_y = torch.tensor(sobel_y).unsqueeze(0).unsqueeze(0)
-        kernel_x = torch.tensor(sobel_x).unsqueeze(0).unsqueeze(0)
+        kernel_y = torch.from_numpy(sobel_y).unsqueeze(0).unsqueeze(0)  # [1,1,3,3]
+        kernel_x = torch.from_numpy(sobel_x).unsqueeze(0).unsqueeze(0)
+
+        # 对每个输入通道重复（深度卷积）
         kernel_y = kernel_y.repeat(channel, 1, 1, 1)
         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
 
-        self.sobel_conv_y = nn.Conv2d(channel, channel, 3, padding=1, groups=channel, bias=False)
-        self.sobel_conv_x = nn.Conv2d(channel, channel, 3, padding=1, groups=channel, bias=False)
-        self.sobel_conv_y.weight.data = kernel_y.clone()
-        self.sobel_conv_x.weight.data = kernel_x.clone()
-        self.sobel_conv_y.weight.requires_grad = False
-        self.sobel_conv_x.weight.requires_grad = False
+        # 注册为 buffer（不可训练参数）
+        self.register_buffer('weight_y', kernel_y)
+        self.register_buffer('weight_x', kernel_x)
+        self.groups = channel
 
     def forward(self, x):
-        # --- Step 1: Gaussian blur to suppress noise ---
-        if self.apply_blur:
-            x = gaussian_blur(x, self.blur_kernel, self.blur_sigma)
+        # 选择 padding 模式
+        padding = 1
+        if self.use_reflect:
+            x = F.pad(x, (1, 1, 1, 1), mode='reflect')
+            padding = 0
 
-        # --- Step 2: Compute gradients ---
-        edge_x = self.sobel_conv_x(x)
-        edge_y = self.sobel_conv_y(x)
+        edge_x = F.conv2d(x, self.weight_x, groups=self.groups, padding=padding)
+        edge_y = F.conv2d(x, self.weight_y, groups=self.groups, padding=padding)
+
+        # 计算梯度幅值
         edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
 
-        # --- Step 3: Mask border responses ---
-        edge = mask_border(edge, border=1)
-
-        # --- Step 4: Normalize and soft threshold ---
-        max_val = edge.amax(dim=(-2, -1), keepdim=True) + 1e-6
-        edge = edge / max_val
-        edge = torch.where(edge > self.edge_thr, edge, torch.zeros_like(edge))
-
+        min_val = edge.amin(dim=(2, 3), keepdim=True)
+        max_val = edge.amax(dim=(2, 3), keepdim=True)
+        edge = (edge - min_val) / (max_val - min_val + 1e-6)
+        edge = torch.where(edge > 0.2, edge, torch.zeros_like(edge))
         return edge
-
-
 
 class MultiScaleEdgeInfoGenerator(nn.Module):
     def __init__(self, inc, oucs) -> None:
