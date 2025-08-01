@@ -101,9 +101,6 @@ import torch.nn.functional as F
 class SobelConv(nn.Module):
     def __init__(self, channel):
         super().__init__()
-        self.use_reflect = use_reflect
-        self.normalize = normalize
-        self.mask = mask
 
         # 标准 Sobel 卷积核
         sobel_y = np.array([[1, 2, 1],
@@ -125,13 +122,10 @@ class SobelConv(nn.Module):
 
     def forward(self, x):
         # 选择 padding 模式
-        padding = 1
-        if self.use_reflect:
-            x = F.pad(x, (1, 1, 1, 1), mode='reflect')
-            padding = 0
+        x = F.pad(x, (1, 1, 1, 1), mode='reflect')
 
-        edge_x = F.conv2d(x, self.weight_x, groups=self.groups, padding=padding)
-        edge_y = F.conv2d(x, self.weight_y, groups=self.groups, padding=padding)
+        edge_x = F.conv2d(x, self.weight_x, groups=self.groups, padding=0)
+        edge_y = F.conv2d(x, self.weight_y, groups=self.groups, padding=0)
 
         # 计算梯度幅值
         edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
