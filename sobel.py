@@ -99,8 +99,13 @@ import torch.nn.functional as F
 
 
 class SobelConv(nn.Module):
-    def __init__(self, channel):
+    def __init__(self, channel, kernel_size=3, sigma=1.0):
         super().__init__()
+
+        # 创建高斯核
+        self.gaussian_kernel = self._create_gaussian_kernel(kernel_size, sigma)
+        self.gaussian_kernel = self.gaussian_kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, k, k]
+        self.gaussian_kernel = self.gaussian_kernel.repeat(channel, 1, 1, 1)  # [channel, 1, k, k]
 
         # 标准 Sobel 卷积核
         sobel_y = np.array([[1, 2, 1],
@@ -116,25 +121,61 @@ class SobelConv(nn.Module):
         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
 
         # 注册为 buffer（不可训练参数）
+        self.register_buffer('gaussian_weight', self.gaussian_kernel)
         self.register_buffer('weight_y', kernel_y)
         self.register_buffer('weight_x', kernel_x)
         self.groups = channel
 
+    def _create_gaussian_kernel(self, kernel_size, sigma):
+        """创建高斯核"""
+        if kernel_size % 2 == 0:
+            raise ValueError("Kernel size must be odd")
+
+        # 创建坐标网格
+        ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
+        xx, yy = torch.meshgrid(ax, ax, indexing='ij')
+
+        # 计算高斯核
+        kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+        kernel = kernel / kernel.sum()
+
+        return kernel
+
     def forward(self, x):
-        # 选择 padding 模式
-        x = F.pad(x, (1, 1, 1, 1), mode='reflect')
+        # 1. 先进行高斯平滑
+        x_smooth = F.conv2d(x, self.gaussian_weight, groups=self.groups, padding='same')
 
-        edge_x = F.conv2d(x, self.weight_x, groups=self.groups, padding=0)
-        edge_y = F.conv2d(x, self.weight_y, groups=self.groups, padding=0)
+        # 2. 再进行 Sobel 边缘检测（添加 padding）
+        x_padded = F.pad(x_smooth, (1, 1, 1, 1), mode='reflect')
 
-        # 计算梯度幅值
+        edge_x = F.conv2d(x_padded, self.weight_x, groups=self.groups, padding=0)
+        edge_y = F.conv2d(x_padded, self.weight_y, groups=self.groups, padding=0)
+
+        # 3. 计算梯度幅值
         edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
 
+        # 4. 归一化到 [0, 1]
         min_val = edge.amin(dim=(2, 3), keepdim=True)
         max_val = edge.amax(dim=(2, 3), keepdim=True)
         edge = (edge - min_val) / (max_val - min_val + 1e-6)
+
+        # 5. 应用阈值过滤
         edge = torch.where(edge > 0.2, edge, torch.zeros_like(edge))
         return edge
+
+
+# 使用示例
+if __name__ == "__main__":
+    # 创建模型
+    sobel_conv = SobelConv(channel=3, kernel_size=5, sigma=1.0)
+
+    # 创建测试输入 (batch_size=1, channels=3, height=64, width=64)
+    x = torch.randn(1, 3, 64, 64)
+
+    # 前向传播
+    edge_output = sobel_conv(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Edge output shape: {edge_output.shape}")
 
 class MultiScaleEdgeInfoGenerator(nn.Module):
     def __init__(self, inc, oucs) -> None:
