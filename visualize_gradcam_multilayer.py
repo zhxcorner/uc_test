@@ -6,56 +6,103 @@ import os
 from PIL import Image
 from torchvision import transforms
 import argparse
+import json
 
-# 解析参数
-parser = argparse.ArgumentParser(description='Test a trained model from log directory.')
+# === 解析参数 ===
+parser = argparse.ArgumentParser(description='Generate Grad-CAM visualizations using config from log directory.')
 parser.add_argument('--log_dir', type=str, required=True,
                     help='Path to the log directory containing config.json and best.pth')
 args = parser.parse_args()
 
 # === Settings ===
-model_path = os.path.join(args.log_dir, 'UCNet_best.pth')
-val_path = '/data/单个细胞分类数据集二分类S2L/train'
-output_dir = '../gradcam_output_multilayer'
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-img_size = 224
-num_classes = 2
+log_dir = args.log_dir
+config_path = os.path.join(log_dir, 'config.json')
+model_path = None
+# 查找 best.pth 文件
+for file in os.listdir(log_dir):
+    if file.endswith('best.pth'):
+        model_path = os.path.join(log_dir, file)
+        break
 
-# === Preprocessing ===
+if not model_path:
+    raise FileNotFoundError(f"No best.pth found in {log_dir}")
+
+if not os.path.exists(config_path):
+    raise FileNotFoundError(f"config.json not found in {log_dir}")
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+output_dir = '../gradcam_output_multilayer'
+
+# === 动态导入模型类 ===
+from MedMamba import (
+    VSSM as vssm,
+    VSSMEdgeEnhanced as edge_enhanced,
+    DualBranchVSSM as dual_branch,
+    DualBranchVSSMEnhanced as dual_branch_enhanced
+)
+
+MODEL_MAP = {
+    'vssm': vssm,
+    'edge_enhanced': edge_enhanced,
+    'dual_branch': dual_branch,
+    'dual_branch_enhanced': dual_branch_enhanced,
+}
+
+# === 读取配置并构建模型 ===
+with open(config_path, 'r') as f:
+    config = json.load(f)
+
+model_type = config.get('model_type')
+num_classes = config.get('num_classes')
+img_size = config.get('img_size', 224)  # 默认 224
+
+if model_type not in MODEL_MAP:
+    raise ValueError(f"Unsupported model_type: {model_type}, must be one of {list(MODEL_MAP.keys())}")
+
+# 构建 kwargs
+model_kwargs = {}
+if model_type == 'edge_enhanced':
+    model_kwargs.update({
+        'edge_layer_idx': config.get('edge_layer_idx'),
+        'fusion_levels': config.get('fusion_levels'),
+        'edge_attention': config.get('edge_attention'),
+        'fusion_mode': config.get('fusion_mode', 'concat')
+    })
+elif model_type in ['dual_branch', 'dual_branch_enhanced']:
+    model_kwargs.update({
+        'fusion_levels': config.get('fusion_levels'),
+        'edge_attention': config.get('edge_attention'),
+        'fusion_mode': config.get('fusion_mode', 'concat')
+    })
+
+# 实例化模型
+model_class = MODEL_MAP[model_type]
+model = model_class(num_classes=num_classes, **model_kwargs).to(device)
+model.load_state_dict(torch.load(model_path, map_location=device))
+model.eval()
+
+print(f"✅ Loaded model: {model_type}")
+print(f"   Config: num_classes={num_classes}, img_size={img_size}, kwargs={model_kwargs}")
+
+# === 预处理 ===
 transform = transforms.Compose([
     transforms.Resize((img_size, img_size)),
     transforms.ToTensor(),
-    transforms.Normalize((0.5,)*3, (0.5,)*3)
+    transforms.Normalize((0.5,) * 3, (0.5,) * 3)
 ])
 
-
+# === Sobel 边缘检测 ===
 def sobel_edge_detection(image_path):
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     image = cv2.resize(image, (img_size, img_size))
-
     grad_x = cv2.Sobel(image, cv2.CV_64F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(image, cv2.CV_64F, 0, 1, ksize=3)
     edge = cv2.magnitude(grad_x, grad_y)
     edge = (edge / edge.max()) * 255
     edge_map = np.uint8(edge)
+    return cv2.cvtColor(edge_map, cv2.COLOR_GRAY2RGB)
 
-    # 转换为三通道便于拼接
-    edge_map = cv2.cvtColor(edge_map, cv2.COLOR_GRAY2RGB)
-    return edge_map
-
-# === Load Model ===
-# from MedMamba import DualBranchVSSM
-from MedMamba import DualBranchVSSMEnhanced as DualBranchVSSM
-model = DualBranchVSSM(
-    num_classes=num_classes,
-    fusion_levels=[0, 1, 2],
-    fusion_mode='gate',
-    edge_attention='none'
-).to(device)
-model.load_state_dict(torch.load(model_path, map_location=device))
-model.eval()
-
-# === Hook Setup for Multiple Layers ===
+# === Grad-CAM 多层 Hook ===
 features = {}
 gradients = {}
 
@@ -69,31 +116,31 @@ def get_gradient(name):
         gradients[name] = grad_output[0].detach()
     return hook
 
-# Layer names and modules
-# target_layer_names = ["edge_conv0", "edge_conv1", "edge_conv2"]
-# target_layers = [
-#     model.edge_convs[0].conv,
-#     model.edge_convs[1].conv,
-#     model.edge_convs[2].conv,
-# ]
-target_layer_names = ["fusion0", "fusion1", "fusion2"]
-target_layers = [
-    model.fusers[0],
-    model.fusers[1],
-    model.fusers[2],
-]
+# 自动根据模型类型和 fusion_levels 确定目标层
+target_layer_names = []
+target_layers = []
 
-# Register hooks
+if hasattr(model, 'fusers') and isinstance(config.get('fusion_levels'), list):
+    for level in config['fusion_levels']:
+        name = f"fusion{level}"
+        layer = model.fusers[level]
+        target_layer_names.append(name)
+        target_layers.append(layer)
+    print(f"🎯 Registered fusion layers: {target_layer_names}")
+else:
+    raise RuntimeError("Model does not have 'fusers' or 'fusion_levels' not defined in config.")
+
+# 注册钩子
 hooks = []
 for name, layer in zip(target_layer_names, target_layers):
     hooks.append(layer.register_forward_hook(get_activation(name)))
     hooks.append(layer.register_full_backward_hook(get_gradient(name)))
 
-# === Helper to apply Grad-CAM ===
+# === 生成 Grad-CAM ===
 def generate_cams(image_tensor, class_idx):
     global features, gradients
-    features = {}
-    gradients = {}
+    features.clear()
+    gradients.clear()
 
     image_tensor = image_tensor.unsqueeze(0).to(device)
     output = model(image_tensor)
@@ -104,10 +151,9 @@ def generate_cams(image_tensor, class_idx):
 
     cam_maps = []
     for name in target_layer_names:
-        fmap = features[name].squeeze(0)     # shape: [C, H, W]
-        grad = gradients[name].squeeze(0)    # shape: [C, H, W]
-
-        weights = grad.mean(dim=(1, 2))      # shape: [C]
+        fmap = features[name].squeeze(0)  # [C, H, W]
+        grad = gradients[name].squeeze(0)  # [C, H, W]
+        weights = grad.mean(dim=(1, 2))    # [C]
         cam = (weights[:, None, None] * fmap).sum(dim=0)
         cam = F.relu(cam)
         cam = (cam - cam.min()) / (cam.max() + 1e-8)
@@ -117,7 +163,7 @@ def generate_cams(image_tensor, class_idx):
 
     return cam_maps, pred
 
-# === Overlay CAM on image ===
+# === 叠加热力图 ===
 def overlay_cam(image_path, cam_map):
     image = Image.open(image_path).convert('RGB').resize((img_size, img_size))
     img_np = np.array(image)
@@ -126,43 +172,46 @@ def overlay_cam(image_path, cam_map):
     overlay = 0.5 * img_np + 0.5 * heatmap
     return np.uint8(overlay)
 
-# === Process all images (only first 10 per class) ===
+# === 处理图像 ===
+val_path = '/data/单个细胞分类数据集二分类S2L/train'  # 可考虑也从 config 读取
 os.makedirs(output_dir, exist_ok=True)
 class_dirs = sorted(os.listdir(val_path))
 
 for cls_name in class_dirs:
     input_dir = os.path.join(val_path, cls_name)
-    save_dir = os.path.join(output_dir, cls_name)
+    if not os.path.isdir(input_dir):
+        continue
+    save_dir = os.path.join(output_dir, os.path.basename(log_dir), cls_name)  # 按 log_dir 分文件夹
     os.makedirs(save_dir, exist_ok=True)
 
     class_idx = 0 if cls_name.lower() == 'lguc' else 1
-    img_files = sorted(os.listdir(input_dir))[:10]  # Only take first 10 images
+    img_files = sorted(os.listdir(input_dir))[:10]
 
     for i, img_file in enumerate(img_files):
         img_path = os.path.join(input_dir, img_file)
-        image = Image.open(img_path).convert("RGB")
-        input_tensor = transform(image)
+        try:
+            image = Image.open(img_path).convert("RGB")
+            input_tensor = transform(image)
 
-        # 在 for 循环内找到下面这段代码：
-        cam_maps, pred = generate_cams(input_tensor, class_idx)
+            cam_maps, pred = generate_cams(input_tensor, class_idx)
 
-        # === 新增内容开始 ===
-        # 获取原始图像和 Sobel 边缘图
-        base_img = Image.open(img_path).convert('RGB').resize((img_size, img_size))
-        base_np = np.array(base_img)
+            # 构建可视化图：原始图 | Sobel 边缘 | 多层 CAM
+            base_img = np.array(image.resize((img_size, img_size)))
+            sobel_map = sobel_edge_detection(img_path)
+            cam_overlays = [overlay_cam(img_path, cam) for cam in cam_maps]
 
-        # 生成 Sobel 边缘图
-        sobel_map = sobel_edge_detection(img_path)
+            combined_images = [base_img, sobel_map] + cam_overlays
+            combined = np.hstack(combined_images)
 
-        # 生成 CAM 的 overlay 图像
-        cam_overlays = [overlay_cam(img_path, cam) for cam in cam_maps]
+            # 保存路径包含 log_dir 名称，避免冲突
+            save_path = os.path.join(save_dir, f'gradcam_{i:03d}.jpg')
+            cv2.imwrite(save_path, cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
 
-        # 插入 Sobel 图像到第1个位置（索引为1）
-        combined_images = [base_np, sobel_map] + cam_overlays
-        combined = np.hstack(combined_images)
-        # === 新增内容结束 ===
+            pred_label = 'HGUC' if pred == 0 else 'LGUC'
+            print(f"[{cls_name}] Saved: {save_path} | Pred: {pred_label}")
+        except Exception as e:
+            print(f"[Error] Failed on {img_path}: {e}")
 
-        save_path = os.path.join(save_dir, f'cam_{cls_name}_{i:03d}.jpg')
-        cv2.imwrite(save_path, cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
-
-        print(f"[{cls_name}] Saved: {save_path} | Predicted: {'LGUC' if pred == 0 else 'HGUC'}")
+# 清理钩子
+for hook in hooks:
+    hook.remove()

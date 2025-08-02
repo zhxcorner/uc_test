@@ -35,121 +35,65 @@ class Conv(nn.Module):
 
 import torch.nn.functional as F
 
-# def mask_border(x, border=1):
-#     # x: Tensor of shape (B, C, H, W)
-#     x[..., :border, :] = 0
-#     x[..., -border:, :] = 0
-#     x[..., :, :border] = 0
-#     x[..., :, -border:] = 0
-#     return x
-#
-# class SobelConv(nn.Module):
-#     def __init__(self, channel):
-#         super().__init__()
-#
-#         # Sobel 核心
-#         # sobel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float32)
-#         sobel_y = np.array([[3, 10, 3], [0, 0, 0], [-3, -10, -3]], dtype=np.float32)
-#         sobel_x = sobel_y.T  # 横向
-#
-#         # 转成 tensor，shape(1, 1, 3, 3)
-#         kernel_y = torch.tensor(sobel_y).unsqueeze(0).unsqueeze(0)  # [1, 1, 3, 3]
-#         kernel_x = torch.tensor(sobel_x).unsqueeze(0).unsqueeze(0)
-#
-#         # 扩展为每个通道独立卷积(C, 1, 3, 3)
-#         kernel_y = kernel_y.repeat(channel, 1, 1, 1)  # shape: (C, 1, 3, 3)
-#         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
-#
-#         # 定义 depthwise Conv2d 每个通道单独卷积
-#         self.sobel_conv_y = nn.Conv2d(
-#             in_channels=channel,
-#             out_channels=channel,
-#             kernel_size=3,
-#             padding=1,
-#             groups=channel,
-#             bias=False
-#         )
-#         self.sobel_conv_x = nn.Conv2d(
-#             in_channels=channel,
-#             out_channels=channel,
-#             kernel_size=3,
-#             padding=1,
-#             groups=channel,
-#             bias=False
-#         )
-#
-#         # 赋值并固定权重
-#         self.sobel_conv_y.weight.data = kernel_y.clone()
-#         self.sobel_conv_x.weight.data = kernel_x.clone()
-#         self.sobel_conv_y.weight.requires_grad = False
-#         self.sobel_conv_x.weight.requires_grad = False
-#
-#
-#
-#     def forward(self, x):
-#         edge_x = self.sobel_conv_x(x)
-#         edge_y = self.sobel_conv_y(x)
-#         # edge = edge_x + edge_y
-#         edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
-#
-#         # ✅ 抑制边缘响应
-#         edge = mask_border(edge, border=1)
-#
-#         return edge
-
 
 class SobelConv(nn.Module):
-    def __init__(self, channel, kernel_size=3, sigma=1.0):
+    def __init__(self, channel, kernel_size=5, sigma=2.0, edge_threshold=0.2):
+        """
+        Sobel 边缘提取 + 高斯预平滑
+        参数:
+            channel: 输入通道数
+            kernel_size: 高斯核大小 (推荐 5 或 7)
+            sigma: 高斯核标准差
+            edge_threshold: 阈值，控制弱边缘抑制
+        """
         super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be odd")
 
-        # 创建高斯核
-        self.gaussian_kernel = self._create_gaussian_kernel(kernel_size, sigma)
-        self.gaussian_kernel = self.gaussian_kernel.unsqueeze(0).unsqueeze(0)  # [1, 1, k, k]
-        self.gaussian_kernel = self.gaussian_kernel.repeat(channel, 1, 1, 1)  # [channel, 1, k, k]
+        self.edge_threshold = edge_threshold
+        self.groups = channel
 
-        # 标准 Sobel 卷积核
+        # --- 高斯核 ---
+        gaussian_kernel = self._create_gaussian_kernel(kernel_size, sigma)
+        gaussian_kernel = gaussian_kernel.unsqueeze(0).unsqueeze(0)
+        gaussian_kernel = gaussian_kernel.repeat(channel, 1, 1, 1)
+        self.register_buffer('gaussian_weight', gaussian_kernel)
+
+        # --- Sobel 核 ---
         sobel_y = np.array([[1, 2, 1],
                             [0, 0, 0],
                             [-1, -2, -1]], dtype=np.float32)
         sobel_x = sobel_y.T
-
-        kernel_y = torch.from_numpy(sobel_y).unsqueeze(0).unsqueeze(0)  # [1,1,3,3]
+        kernel_y = torch.from_numpy(sobel_y).unsqueeze(0).unsqueeze(0)
         kernel_x = torch.from_numpy(sobel_x).unsqueeze(0).unsqueeze(0)
-
-        # 对每个输入通道重复（深度卷积）
         kernel_y = kernel_y.repeat(channel, 1, 1, 1)
         kernel_x = kernel_x.repeat(channel, 1, 1, 1)
 
-        # 注册为 buffer（不可训练参数）
-        self.register_buffer('gaussian_weight', self.gaussian_kernel)
         self.register_buffer('weight_y', kernel_y)
         self.register_buffer('weight_x', kernel_x)
-        self.groups = channel
+
+        # 根据高斯核大小动态计算 pad
+        self.gaussian_pad = kernel_size // 2
 
     def _create_gaussian_kernel(self, kernel_size, sigma):
-        """创建高斯核"""
-        if kernel_size % 2 == 0:
-            raise ValueError("Kernel size must be odd")
-
-        # 创建坐标网格
         ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
         xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-
-        # 计算高斯核
         kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
         kernel = kernel / kernel.sum()
-
         return kernel
 
     def forward(self, x):
-        # 1. 高斯平滑：先 pad 再卷积
-        x_gaussian = F.pad(x, (1, 1, 1, 1), mode='reflect')  # [B,C,H+2,W+2]
-        x_smooth = F.conv2d(x_gaussian, self.gaussian_weight, groups=self.groups, padding=0)  # [B,C,H,W]
+        # 1. 高斯平滑
+        x = F.pad(x, (self.gaussian_pad, self.gaussian_pad, self.gaussian_pad, self.gaussian_pad), mode='reflect')
+        x_smooth = F.conv2d(
+            x, self.gaussian_weight,
+            groups=self.groups, padding=0
+        )
 
-        # 2. Sobel 检测：再 pad 再卷积
-        x_sobel = F.pad(x_smooth, (1, 1, 1, 1), mode='reflect')  # [B,C,H+2,W+2]
-        edge_x = F.conv2d(x_sobel, self.weight_x, groups=self.groups, padding=0)  # [B,C,H,W]
-        edge_y = F.conv2d(x_sobel, self.weight_y, groups=self.groups, padding=0)  # [B,C,H,W]
+        # 2. Sobel 检测 (固定 3x3, 所以 pad=1)
+        x_sobel = F.pad(x_smooth, (1, 1, 1, 1), mode='reflect')
+        edge_x = F.conv2d(x_sobel, self.weight_x, groups=self.groups)
+        edge_y = F.conv2d(x_sobel, self.weight_y, groups=self.groups)
 
         # 3. 计算梯度幅值
         edge = torch.sqrt(edge_x ** 2 + edge_y ** 2 + 1e-6)
@@ -159,9 +103,12 @@ class SobelConv(nn.Module):
         max_val = edge.amax(dim=(2, 3), keepdim=True)
         edge = (edge - min_val) / (max_val - min_val + 1e-6)
 
-        # 5. 应用阈值过滤
-        edge = torch.where(edge > 0.2, edge, torch.zeros_like(edge))
+        # 5. 弱边缘抑制
+        if self.edge_threshold > 0:
+            edge = torch.where(edge > self.edge_threshold, edge, torch.zeros_like(edge))
+
         return edge
+
 
 
 
