@@ -30,7 +30,8 @@ BASE_SAVE_DIR = "./edge_feat_visual"
 os.makedirs(BASE_SAVE_DIR, exist_ok=True)
 
 # === 可视化模式 ===
-VIS_MODES = ['mean', 'abs_mean', 'max', 'l2']
+# VIS_MODES = ['mean', 'abs_mean', 'max', 'l2']
+VIS_MODES = ['mean']
 
 # === 模型映射表 ===
 MODEL_MAP = {

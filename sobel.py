@@ -37,7 +37,7 @@ import torch.nn.functional as F
 
 
 class SobelConv(nn.Module):
-    def __init__(self, channel, kernel_size=5, sigma=2.0, edge_threshold=0.2):
+    def __init__(self, channel, kernel_size=3, sigma=1.0, edge_threshold=0.4):
         """
         Sobel 边缘提取 + 高斯预平滑
         参数:
@@ -75,12 +75,26 @@ class SobelConv(nn.Module):
         # 根据高斯核大小动态计算 pad
         self.gaussian_pad = kernel_size // 2
 
+        # 开运算
+        self.morph_kernel_size = 5
+
     def _create_gaussian_kernel(self, kernel_size, sigma):
         ax = torch.arange(-kernel_size // 2 + 1., kernel_size // 2 + 1.)
         xx, yy = torch.meshgrid(ax, ax, indexing='ij')
         kernel = torch.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
         kernel = kernel / kernel.sum()
         return kernel
+
+    def _morphological_opening(self, x: torch.Tensor):
+        # Step 1: 腐蚀（局部最小）
+        x_padded = F.pad(x, (self.morph_kernel_size // 2, self.morph_kernel_size // 2, self.morph_kernel_size // 2, self.morph_kernel_size // 2), mode='reflect')
+        eroded = -F.max_pool2d(-x_padded, kernel_size=self.morph_kernel_size, stride=1, padding=0)
+
+        # Step 2: 膨胀（局部最大）
+        eroded_padded = F.pad(eroded, (self.morph_kernel_size // 2, self.morph_kernel_size // 2, self.morph_kernel_size // 2, self.morph_kernel_size // 2), mode='reflect')
+        opened = F.max_pool2d(eroded_padded, kernel_size=self.morph_kernel_size, stride=1, padding=0)
+
+        return opened
 
     def forward(self, x):
         # 1. 高斯平滑
@@ -104,10 +118,12 @@ class SobelConv(nn.Module):
         edge = (edge - min_val) / (max_val - min_val + 1e-6)
 
         # 5. 弱边缘抑制
-        if self.edge_threshold > 0:
-            edge = torch.where(edge > self.edge_threshold, edge, torch.zeros_like(edge))
+        edge = torch.where(edge > self.edge_threshold, edge, torch.zeros_like(edge))
+        # 6. 开闭运算去噪点
+        edge = self._morphological_opening(edge)
 
         return edge
+
 
 
 
@@ -138,21 +154,22 @@ class MultiScaleEdgeInfoGenerator_422(nn.Module):
         self.conv_1x1s = nn.ModuleList(Conv(inc, ouc, 1) for ouc in oucs)
 
     def forward(self, x):
-        edge = self.sc(x)  # 原始边缘特征 (B, C, H, W)
+        edge = self.sc(x)  # 原始边缘图 (B, C, H, W)
 
         outputs = []
 
-        # 🔽 第一个输出：下采样4倍（MaxPool两次）
-        x_down = self.maxpool(edge)  # H/2
-        x_down = self.maxpool(x_down)  # H/4
+        # 第一个输出：下采样到 H/4, W/4（对应 patch_size=4）
+        # 使用双线性插值连续下采样两次
+        x_down = F.interpolate(edge, scale_factor=0.5, mode='bilinear', align_corners=False)
+        x_down = F.interpolate(x_down, scale_factor=0.5, mode='bilinear', align_corners=False)
         outputs.append(x_down)
 
-        # 🔁 后续输出：在前一个基础上继续下采样
-        for _ in range(len(self.conv_1x1s) - 1):
-            x_down = self.maxpool(x_down)
+        # 后续输出：在前一个基础上继续下采样
+        for i in range(len(self.conv_1x1s) - 1):
+            x_down = F.interpolate(x_down, scale_factor=0.5, mode='bilinear', align_corners=False)
             outputs.append(x_down)
 
-        # 每个下采样特征通过对应的 1x1 卷积降维
+        # 每个下采样特征通过增强的 1x1 卷积（Conv + BN + ReLU）
         for i in range(len(self.conv_1x1s)):
             outputs[i] = self.conv_1x1s[i](outputs[i])
 
