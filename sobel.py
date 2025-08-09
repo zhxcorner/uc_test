@@ -239,6 +239,78 @@ class CBAM(nn.Module):
         x = self.spatial_attention(x)
         return x
 
+class GatedConvEdgeFusion(nn.Module):
+    def __init__(self, inc, ouc, mode='attention', reduction=16):
+        """
+        Flexible fusion module between main and edge features.
+
+        Args:
+            inc (list): [main_channels, edge_channels]
+            ouc (int): output channels
+            mode (str): one of ['softmax', 'sigmoid', 'add', 'scalar', 'attention', 'transformer']
+            reduction (int): reduction ratio for attention modules
+        """
+        super().__init__()
+        self.c_main, self.c_edge = inc
+        self.ouc = ouc
+        self.mode = mode.lower()
+
+
+        if self.mode == 'softmax':
+            self.gate = nn.Sequential(
+                nn.Conv2d(ouc * 2, 2, kernel_size=1),
+                nn.Softmax(dim=1)
+            )
+        elif self.mode == 'sigmoid':
+            self.gate = nn.Sequential(
+                nn.Conv2d(ouc * 2, 2, kernel_size=1),
+                nn.Sigmoid()
+            )
+        elif self.mode == 'scalar':
+            self.alpha = nn.Parameter(torch.tensor(0.5))
+        elif self.mode == 'attention':
+            self.attn = CBAM(ouc * 2, reduction_ratio=reduction)
+            self.attn_down_sample = nn.Conv2d(ouc * 2, ouc, kernel_size=1)
+        elif self.mode == 'transformer':
+            self.transformer = nn.TransformerEncoderLayer(d_model=ouc, nhead=4)
+        elif self.mode == 'add':
+            pass
+        else:
+            raise ValueError(f"Unsupported fusion mode: {mode}")
+
+        self.output_proj = nn.Sequential(
+            nn.Conv2d(ouc, ouc, kernel_size=1),
+            nn.BatchNorm2d(ouc),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, inputs):
+        main_feat, edge_feat = inputs
+        B, C, H, W = main_feat.shape
+
+        if self.mode in ['softmax', 'sigmoid']:
+            fusion_input = torch.cat([main_feat, edge_feat], dim=1)  # [B, 2C, H, W]
+            weights = self.gate(fusion_input)
+            out = weights[:, 0:1] * main_feat + weights[:, 1:2] * edge_feat
+
+        elif self.mode == 'scalar':
+            out = self.alpha * main_feat + (1 - self.alpha) * edge_feat
+
+        elif self.mode == 'add':
+            out = main_feat + edge_feat
+
+        elif self.mode == 'attention':
+            fusion_input = torch.cat([main_feat, edge_feat], dim=1)
+            out = self.attn_down_sample(self.attn(fusion_input))
+
+        elif self.mode == 'transformer':
+            # Reshape to sequence: [B, C, H, W] �?[B, HW, C]
+            seq = (main_feat + edge_feat).flatten(2).permute(0, 2, 1)
+            seq = self.transformer(seq)
+            out = seq.permute(0, 2, 1).view(B, C, H, W)
+
+        return self.output_proj(out)
+
 # 🔥 合并后的模块
 class ConvEdgeFusion(nn.Module):
     def __init__(self, inc, ouc, attention='none', reduction=16):
@@ -322,80 +394,6 @@ class ConvEdgeFusion1(nn.Module):
         x = self.final_conv(x)
         return x
 
-class GatedConvEdgeFusion(nn.Module):
-    def __init__(self, inc, ouc, mode='softmax', reduction=16):
-        """
-        Flexible fusion module between main and edge features.
-
-        Args:
-            inc (list): [main_channels, edge_channels]
-            ouc (int): output channels
-            mode (str): one of ['softmax', 'sigmoid', 'add', 'scalar', 'attention', 'transformer']
-            reduction (int): reduction ratio for attention modules
-        """
-        super().__init__()
-        self.c_main, self.c_edge = inc
-        self.ouc = ouc
-        self.mode = mode.lower()
-
-        self.align_main = nn.Conv2d(self.c_main, ouc, kernel_size=1)
-        self.align_edge = nn.Conv2d(self.c_edge, ouc, kernel_size=1)
-
-        if self.mode == 'softmax':
-            self.gate = nn.Sequential(
-                nn.Conv2d(ouc * 2, 2, kernel_size=1),
-                nn.Softmax(dim=1)
-            )
-        elif self.mode == 'sigmoid':
-            self.gate = nn.Sequential(
-                nn.Conv2d(ouc * 2, 2, kernel_size=1),
-                nn.Sigmoid()
-            )
-        elif self.mode == 'scalar':
-            self.alpha = nn.Parameter(torch.tensor(0.5))
-        elif self.mode == 'attention':
-            self.attn = CBAM(ouc * 2, reduction_ratio=reduction)
-        elif self.mode == 'transformer':
-            self.transformer = nn.TransformerEncoderLayer(d_model=ouc, nhead=4)
-        elif self.mode == 'add':
-            pass
-        else:
-            raise ValueError(f"Unsupported fusion mode: {mode}")
-
-        self.output_proj = nn.Sequential(
-            nn.Conv2d(ouc, ouc, kernel_size=1),
-            nn.BatchNorm2d(ouc),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, inputs):
-        main_feat, edge_feat = inputs
-        # main_feat = self.align_main(main_feat)
-        # edge_feat = self.align_edge(edge_feat)
-        B, C, H, W = main_feat.shape
-
-        if self.mode in ['softmax', 'sigmoid']:
-            fusion_input = torch.cat([main_feat, edge_feat], dim=1)  # [B, 2C, H, W]
-            weights = self.gate(fusion_input)
-            out = weights[:, 0:1] * main_feat + weights[:, 1:2] * edge_feat
-
-        elif self.mode == 'scalar':
-            out = self.alpha * main_feat + (1 - self.alpha) * edge_feat
-
-        elif self.mode == 'add':
-            out = main_feat + edge_feat
-
-        elif self.mode == 'attention':
-            fusion_input = torch.cat([main_feat, edge_feat], dim=1)
-            out = self.attn(fusion_input)
-
-        elif self.mode == 'transformer':
-            # Reshape to sequence: [B, C, H, W] �?[B, HW, C]
-            seq = (main_feat + edge_feat).flatten(2).permute(0, 2, 1)
-            seq = self.transformer(seq)
-            out = seq.permute(0, 2, 1).view(B, C, H, W)
-
-        return self.output_proj(out)
 
 
 class DualPathEdgeFusion(nn.Module):
