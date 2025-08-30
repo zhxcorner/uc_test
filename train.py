@@ -83,6 +83,8 @@ def main():
     parser.add_argument('--fusion_mode', type=str, default='concat',
                         choices=['concat', 'gate', 'dual'],
                         help='Fusion method to use in edge fusion module (default: concat)')
+    parser.add_argument('--dataset', type=str, default='单个细胞分类数据集二分类S2L')
+    parser.add_argument('--epochs', type=int, default=100)
 
     args = parser.parse_args()
 
@@ -107,9 +109,9 @@ def main():
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     }
 
-    train_dataset = datasets.ImageFolder(root="/data/单个细胞分类数据集二分类S2L/train",
+    train_dataset = datasets.ImageFolder(root=f"/data/{args.dataset}/train",
                                          transform=data_transform["train"])
-    val_dataset = datasets.ImageFolder(root="/data/单个细胞分类数据集二分类S2L/val",
+    val_dataset = datasets.ImageFolder(root=f"/data/{args.dataset}/val",
                                        transform=data_transform["val"])
 
     train_num = len(train_dataset)
@@ -150,7 +152,7 @@ def main():
     optimizer = optim.Adam(net.parameters(), lr=0.0001)
 
     best_acc = 0.0
-    epochs = 100
+    epochs = args.epochs
     train_steps = len(train_loader)
 
     for epoch in range(epochs):

@@ -80,14 +80,14 @@ def load_config_and_test_model(log_dir):
     except Exception as e:
         print(f"[{log_dir}] ❌ Failed to load model: {e}")
         return
-
+    dataset = config['dataset']
     # 加载测试集
     data_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    test_dataset = datasets.ImageFolder(root="/data/单个细胞分类数据集二分类S2L/test", transform=data_transform)
+    test_dataset = datasets.ImageFolder(root=f"/data/{dataset}/test", transform=data_transform)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 
     test_acc = evaluate_model(model, test_loader, device, len(test_dataset))

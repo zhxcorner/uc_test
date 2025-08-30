@@ -240,7 +240,7 @@ class CBAM(nn.Module):
         return x
 
 class GatedConvEdgeFusion(nn.Module):
-    def __init__(self, inc, ouc, mode='attention', reduction=16):
+    def __init__(self, inc, ouc, mode='softmax', reduction=16):
         """
         Flexible fusion module between main and edge features.
 
@@ -313,7 +313,7 @@ class GatedConvEdgeFusion(nn.Module):
 
 # 🔥 合并后的模块
 class ConvEdgeFusion(nn.Module):
-    def __init__(self, inc, ouc, attention='none', reduction=16):
+    def __init__(self, inc, ouc, attention='cbam', reduction=16):
         """
         Args:
             inc (List[int]): list of input channels, e.g. [256, 256]

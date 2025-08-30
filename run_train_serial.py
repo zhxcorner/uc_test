@@ -16,14 +16,26 @@ def main():
         sys.exit(1)
 
     # 构建命令（使用列表形式更安全，但这里涉及重定向，使用 shell=True + 字符串）
+    # command = (
+    #     "python train.py "
+    #     "--model_type dual_branch_enhanced "
+    #     "--fusion_levels 0 1 2 "
+    #     "--num_classes 2 "
+    #     "--model_name UC "
+    #     "--edge_attention cbam "
+    #     "--fusion_mode concat "
+    # )
+
     command = (
         "python train.py "
-        "--model_type dual_branch_enhanced "
-        "--fusion_levels 0 1 "
-        "--num_classes 2 "
+        "--model_type vssm "
+        "--fusion_levels 0 1 2 "
+        "--num_classes 7 "
         "--model_name UC "
-        "--edge_attention none "
-        "--fusion_mode gate"
+        "--edge_attention cbam "
+        "--fusion_mode concat "
+        "--epochs 100 "
+        "--dataset smear2005_dataset"
     )
 
     # 每次运行输出到不同的日志文件，避免覆盖
