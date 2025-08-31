@@ -87,7 +87,7 @@ def main():
                         help='Fusion method to use in edge fusion module (default: concat)')
     parser.add_argument('--dataset', type=str, default='单个细胞分类数据集二分类S2L')
     parser.add_argument('--epochs', type=int, default=100)
-
+    parser.add_argument('--batch_size', type=int, default=32)
     args = parser.parse_args()
 
     valid_params = {k: v for k, v in vars(args).items()}
@@ -99,10 +99,23 @@ def main():
     logging.info(f"Training parameters saved to: {config_path}")
 
     # 数据预处理
+    # data_transform = {
+    #     "train": transforms.Compose([
+    #         transforms.RandomResizedCrop(224),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]),
+    #     "val": transforms.Compose([
+    #         transforms.Resize((224, 224)),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+    # }
+
+
+    # 数据预处理
     data_transform = {
         "train": transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]),
         "val": transforms.Compose([
@@ -112,7 +125,7 @@ def main():
     }
 
     # 加载数据集
-    all_data = datasets.ImageFolder(root=args.dataset, transform=data_transform["train"])
+    all_data = datasets.ImageFolder(root=f"/data/{args.dataset}", transform=data_transform["train"])
 
     kf = KFold(n_splits=5, shuffle=True, random_state=42)  # 固定随机种子，确保划分一致
 
@@ -178,24 +191,26 @@ def main():
                 train_bar.set_postfix(loss=f"{loss.item():.3f}")
 
             # Validate
+            # Validate
             net.eval()
-            acc = 0.0
+            acc = 0
+            total = 0
             with torch.no_grad():
                 val_bar = tqdm(val_loader, file=sys.stdout, desc="Validating")
-                for val_data in val_bar:
-                    val_images, val_labels = val_data
+                for val_images, val_labels in val_bar:
                     outputs = net(val_images.to(device))
                     predict_y = torch.max(outputs, dim=1)[1]
                     acc += torch.eq(predict_y, val_labels.to(device)).sum().item()
+                    total += val_labels.size(0)
 
-            val_accurate = acc / len(val_data)
-            print(f"[Epoch {epoch + 1}] Train Loss: {running_loss / train_steps:.3f} | Val Acc: {val_accurate:.3f}")
-            logging.info('[epoch %d] train_loss: %.3f  val_accuracy: %.3f' %
-                         (epoch + 1, running_loss / train_steps, val_accurate))
+            val_accurate = acc / total
+            print(f"[Epoch {epoch + 1}] Train Loss: {running_loss / train_steps:.3f} | Val Acc: {val_accurate:.4f}")
+            logging.info('[epoch %d] train_loss: %.3f  val_accuracy: %.4f',
+                         epoch + 1, running_loss / train_steps, val_accurate)
 
             if val_accurate > best_acc:
                 best_acc = val_accurate
-                torch.save(net.state_dict(), save_path)
+                torch.save(net.state_dict(), save_path.replace('best', f'best_{fold + 1}'))
                 print(f"Saved new best model with val accuracy: {best_acc:.4f}")
                 logging.info(f"Saved new best model with val accuracy: {best_acc:.4f}")
 
