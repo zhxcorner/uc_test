@@ -46,13 +46,39 @@ def setup_logger_and_saver(model_name="ResNet101"):
     return log_dir, model_save_path
 
 
+def compute_mean_std(dataset_root, indices, batch_size=64, num_workers=4):
+    """
+    计算指定 indices 图像的 mean 和 std（不修改原始 dataset）
+    """
+    temp_dataset = datasets.ImageFolder(
+        root=dataset_root,
+        transform=transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor()
+        ])
+    )
+    subset = Subset(temp_dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    mean = torch.zeros(3)
+    std = torch.zeros(3)
+    total_images = 0
+
+    with torch.no_grad():
+        for images, _ in loader:
+            batch_size = images.size(0)
+            mean += images.mean(dim=[0, 2, 3]) * batch_size
+            std += images.std(dim=[0, 2, 3]) * batch_size
+            total_images += batch_size
+
+    mean /= total_images
+    std /= total_images
+
+    return mean.tolist(), std.tolist()
+
+
 # ========== Model ==========
-def build_resnet101(num_classes: int = 2, pretrained: bool = True):
-    """
-    返回一个用于分类的 ResNet-101。
-    - pretrained=True 使用 ImageNet 预训练权重
-    - freeze_backbone=True 冻结除最后 fc 外的参数
-    """
+def build_resnet101(num_classes: int = 2, pretrained: bool = False):
     if pretrained:
         try:
             weights = models.ResNet101_Weights.IMAGENET1K_V2
@@ -75,10 +101,10 @@ def train_one_epoch(model, loader, device, optimizer, loss_fn):
 
     pbar = tqdm(loader, desc="Training", leave=False, file=sys.stdout)
     for images, labels in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        images = images.to(device)
+        labels = labels.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
         outputs = model(images)
         loss = loss_fn(outputs, labels)
         loss.backward()
@@ -98,14 +124,14 @@ def evaluate(model, loader, device):
 
     pbar = tqdm(loader, desc="Validating", leave=False, file=sys.stdout)
     for images, labels in pbar:
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        images = images.to(device)
+        labels = labels.to(device)
         outputs = model(images)
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
-    return correct / max(1, total)
+    return correct / total
 
 
 # ========== Main ==========
@@ -116,8 +142,7 @@ def main():
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--k_folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -139,25 +164,10 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"using {device} device.")
 
-    # 数据增强 / 预处理（与您原来的风格保持一致）
-    data_transform_train = transforms.Compose([
-        transforms.Resize((224, 224)),
-        # 如果希望更强增强可改为 RandomResizedCrop + Flip：
-        # transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
-        # transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    data_transform_val = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-
-    # 数据集
+    # 数据集（先不加 transform，后面每折单独加）
     dataset_root = f"/data/{args.dataset}"
-    full_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_train)
-    indices = np.arange(len(full_dataset))  # 用显式索引避免 ImageFolder 内部实现变动
+    full_dataset = datasets.ImageFolder(root=dataset_root, transform=None)  # 先不设 transform
+    indices = np.arange(len(full_dataset))
 
     # 五折
     kf = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
@@ -166,39 +176,55 @@ def main():
     for fold, (train_idx, val_idx) in enumerate(kf.split(indices), start=1):
         print(f"\n========== Fold {fold}/{args.k_folds} ==========")
 
-        # 子集与各自 transform
-        train_subset = Subset(full_dataset, train_idx)
-        val_subset = Subset(datasets.ImageFolder(root=dataset_root, transform=data_transform_val), val_idx)
+        # --- 计算当前 fold 训练集的 mean 和 std ---
+        print(f"Fold {fold}: Computing mean and std on training set...")
+        mean, std = compute_mean_std(dataset_root, train_idx, batch_size=args.batch_size, num_workers=args.num_workers)
+        logging.info(f"Fold {fold} - Computed mean: {mean}, std: {std}")
 
-        train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False)
+        # --- 构建每折的 transform ---
+        data_transform_train = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+        data_transform_val = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
 
-        # 模型 & 优化器
-        model = build_resnet101(
-            num_classes=args.num_classes,
-            pretrained=args.pretrained,
-        ).to(device)
+        # --- 为子集设置 transform ---
+        train_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_train)
+        val_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_val)
 
-        optimizer = optim.Adam(model.parameters(), lr=0.0001)
+        train_subset = Subset(train_dataset, train_idx)
+        val_subset = Subset(val_dataset, val_idx)
+
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+        # 模型 & 优化器 & 调度器
+        model = build_resnet101(num_classes=args.num_classes).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs // 2)  # 👈 新增调度器
         loss_fn = nn.CrossEntropyLoss()
 
         best_acc = 0.0
-        # 每折单独的保存路径
         fold_save_path = base_save_path.replace("_best.pth", f"_fold{fold}_best.pth")
 
         for epoch in range(1, args.epochs + 1):
-            # 训练
-            avg_loss = train_one_epoch(model, train_loader, device, optimizer, loss_fn, args.use_amp)
-
-            # 验证
+            avg_loss = train_one_epoch(model, train_loader, device, optimizer, loss_fn)
             val_acc = evaluate(model, val_loader, device)
 
-            print(f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
-                  f"Train Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
-            logging.info(f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
-                         f"Train Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f}")
+            scheduler.step()  # 👈 更新学习率
 
-            # 保存最佳
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
+                  f"Train Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
+            logging.info(f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
+                         f"Train Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
+
             if val_acc > best_acc:
                 best_acc = val_acc
                 torch.save(model.state_dict(), fold_save_path)

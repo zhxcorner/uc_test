@@ -11,7 +11,8 @@ import torch.optim as optim
 from tqdm import tqdm
 from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Subset
-
+import random
+import numpy as np
 # 动态导入模型
 from MedMamba import VSSM as vssm
 from MedMamba import VSSMEdgeEnhanced as edge_enhanced
@@ -25,7 +26,32 @@ MODEL_MAP = {
     'dual_branch': dual_branch,
     'dual_branch_enhanced': dual_branch_enhanced,
 }
+def compute_mean_std(dataset_root, indices, transform, batch_size=32, num_workers=4):
+    temp_dataset = datasets.ImageFolder(root=dataset_root, transform=transform)
+    subset = Subset(temp_dataset, indices)
+    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
+    mean = torch.zeros(3)
+    std = torch.zeros(3)
+    total_images = 0
+
+    with torch.no_grad():
+        for images, _ in loader:
+            batch_size = images.size(0)
+            mean += images.mean(dim=[0, 2, 3]) * batch_size
+            std += images.std(dim=[0, 2, 3]) * batch_size
+            total_images += batch_size
+
+    mean /= total_images
+    std /= total_images
+
+    return mean.tolist(), std.tolist()
+
+def seed_everything(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def setup_logger_and_saver(model_name="UC"):
     current_time = time.strftime("%Y%m%d-%H%M%S")
@@ -89,7 +115,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
     args = parser.parse_args()
-
+    seed_everything()
     valid_params = {k: v for k, v in vars(args).items()}
 
     log_dir, save_path = setup_logger_and_saver(args.model_name)
@@ -98,55 +124,75 @@ def main():
         json.dump(valid_params, f, indent=4)
     logging.info(f"Training parameters saved to: {config_path}")
 
-    # 数据预处理
-    # data_transform = {
-    #     "train": transforms.Compose([
-    #         transforms.RandomResizedCrop(224),
-    #         transforms.RandomHorizontalFlip(),
-    #         transforms.ToTensor(),
-    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]),
-    #     "val": transforms.Compose([
-    #         transforms.Resize((224, 224)),
-    #         transforms.ToTensor(),
-    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    # }
+    # 数据预处理（临时用于计算 mean/std）
+    to_tensor_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor()
+    ])
 
+    # 数据预处理（最终用的）
+    data_transform_train = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(degrees=30),
+        transforms.ToTensor(),
+    ])
+    data_transform_val = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
 
-    # 数据预处理
-    data_transform = {
-        "train": transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]),
-        "val": transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    }
+    # 加载数据集（用于分折）
+    all_data = datasets.ImageFolder(root=f"/data/{args.dataset}", transform=None)
+    indices = np.arange(len(all_data))  # 修正：原代码中 full_dataset 未定义
 
-    # 加载数据集
-    all_data = datasets.ImageFolder(root=f"/data/{args.dataset}", transform=data_transform["train"])
-
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)  # 固定随机种子，确保划分一致
-
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("using {} device.".format(device))
 
     fold_results = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(all_data.imgs)):
+    for fold, (train_idx, val_idx) in enumerate(kf.split(indices)):
         print(f"Fold {fold + 1}/5")
 
-        # 使用KFold索引划分训练集和验证集
-        train_data = Subset(all_data, train_idx)
-        val_data = Subset(all_data, val_idx)
+        # --- 计算当前 fold 训练集的 mean 和 std ---
+        mean, std = compute_mean_std(
+            dataset_root=f"/data/{args.dataset}",
+            indices=train_idx,
+            transform=to_tensor_transform,
+            batch_size=args.batch_size,
+            num_workers=4
+        )
+        logging.info(f"Fold {fold+1} - Computed mean: {mean}, std: {std}")
 
-        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False)
+        # --- 构建每折的 transform ---
+        data_transform_train_norm = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+        data_transform_val_norm = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
 
+        # 使用 KFold 索引划分训练集和验证集
+        train_data = Subset(
+            datasets.ImageFolder(root=f"/data/{args.dataset}", transform=data_transform_train_norm),
+            train_idx
+        )
+        val_data = Subset(
+            datasets.ImageFolder(root=f"/data/{args.dataset}", transform=data_transform_val_norm),
+            val_idx
+        )
+
+        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
         # 构建模型
         model_class = MODEL_MAP[args.model_type]
-
         model_kwargs = {}
 
         if args.model_type == 'edge_enhanced':
@@ -163,13 +209,16 @@ def main():
                 'fusion_mode': args.fusion_mode,
             })
 
-        net = model_class(depths=[2, 2, 4, 2],
-                          dims=[96, 192, 384, 768],
-                          num_classes=args.num_classes,
-                          **model_kwargs).to(device)
+        net = model_class(
+            depths=[2, 2, 4, 2],
+            dims=[96, 192, 384, 768],
+            num_classes=args.num_classes,
+            **model_kwargs
+        ).to(device)
 
         loss_function = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(net.parameters(), lr=0.0001)
+        optimizer = optim.Adam(net.parameters(), lr=5e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)  # 余弦退火
 
         best_acc = 0.0
         train_steps = len(train_loader)
@@ -190,7 +239,10 @@ def main():
                 running_loss += loss.item()
                 train_bar.set_postfix(loss=f"{loss.item():.3f}")
 
-            # Validate
+            # 更新学习率
+            scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+
             # Validate
             net.eval()
             acc = 0
@@ -204,9 +256,10 @@ def main():
                     total += val_labels.size(0)
 
             val_accurate = acc / total
-            print(f"[Epoch {epoch + 1}] Train Loss: {running_loss / train_steps:.3f} | Val Acc: {val_accurate:.4f}")
-            logging.info('[epoch %d] train_loss: %.3f  val_accuracy: %.4f',
-                         epoch + 1, running_loss / train_steps, val_accurate)
+            print(f"[Epoch {epoch + 1}] Train Loss: {running_loss / train_steps:.3f} | "
+                  f"Val Acc: {val_accurate:.4f} | LR: {current_lr:.2e}")
+            logging.info('[epoch %d] train_loss: %.3f  val_accuracy: %.4f  lr: %.2e',
+                         epoch + 1, running_loss / train_steps, val_accurate, current_lr)
 
             if val_accurate > best_acc:
                 best_acc = val_accurate
