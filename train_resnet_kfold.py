@@ -7,6 +7,8 @@ import argparse
 import logging
 import random
 import numpy as np
+import pickle
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -14,7 +16,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms, datasets, models
 from tqdm import tqdm
-from sklearn.model_selection import KFold
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
 
 # ========== Utils ==========
@@ -46,38 +48,6 @@ def setup_logger_and_saver(model_name="ResNet101"):
     return log_dir, model_save_path
 
 
-def compute_mean_std(dataset_root, indices, batch_size=64, num_workers=4):
-    """
-    计算指定 indices 图像的 mean 和 std（不修改原始 dataset）
-    """
-    temp_dataset = datasets.ImageFolder(
-        root=dataset_root,
-        transform=transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor()
-        ])
-    )
-    subset = Subset(temp_dataset, indices)
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    mean = torch.zeros(3)
-    std = torch.zeros(3)
-    total_images = 0
-
-    with torch.no_grad():
-        for images, _ in loader:
-            batch_size = images.size(0)
-            mean += images.mean(dim=[0, 2, 3]) * batch_size
-            std += images.std(dim=[0, 2, 3]) * batch_size
-            total_images += batch_size
-
-    mean /= total_images
-    std /= total_images
-
-    return mean.tolist(), std.tolist()
-
-
-# ========== Model ==========
 def build_resnet101(num_classes: int = 2, pretrained: bool = False):
     if pretrained:
         try:
@@ -94,11 +64,50 @@ def build_resnet101(num_classes: int = 2, pretrained: bool = False):
     return model
 
 
-# ========== Train / Evaluate ==========
+# ========== Evaluate (Multi-metric) ==========
+@torch.no_grad()
+def evaluate_with_metrics(model, loader, device, num_classes):
+    """
+    返回 Accuracy, Precision, Recall, F1
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    pbar = tqdm(loader, desc="Evaluating", leave=False, file=sys.stdout)
+    for images, labels in pbar:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    # 转为 numpy
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    # Accuracy
+    acc = accuracy_score(all_labels, all_preds)
+
+    # Precision, Recall, F1 (weighted for multi-class)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='weighted', zero_division=0
+    )
+
+    return {
+        'acc': acc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
+
+
+# ========== Train One Epoch ==========
 def train_one_epoch(model, loader, device, optimizer, loss_fn):
     model.train()
     running_loss = 0.0
-
     pbar = tqdm(loader, desc="Training", leave=False, file=sys.stdout)
     for images, labels in pbar:
         images = images.to(device)
@@ -116,38 +125,16 @@ def train_one_epoch(model, loader, device, optimizer, loss_fn):
     return running_loss / max(1, len(loader))
 
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    model.eval()
-    correct = 0
-    total = 0
-
-    pbar = tqdm(loader, desc="Validating", leave=False, file=sys.stdout)
-    for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
-        outputs = model(images)
-        preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-
-    return correct / total
-
-
 # ========== Main ==========
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet101 with 5-Fold Cross Validation")
-    # 数据 & 训练相关
     parser.add_argument("--dataset", type=str, default="单个细胞分类数据集二分类S2L", help="ImageFolder 根目录名（挂载在 /data 下）")
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--k_folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-
-    # 模型配置
     parser.add_argument("--model_name", type=str, default="ResNet101")
 
     args = parser.parse_args()
@@ -162,26 +149,85 @@ def main():
 
     # 设备
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"using {device} device.")
+    print(f"Using device: {device}")
 
-    # 数据集（先不加 transform，后面每折单独加）
+    # 数据集路径
     dataset_root = f"/data/{args.dataset}"
-    full_dataset = datasets.ImageFolder(root=dataset_root, transform=None)  # 先不设 transform
-    indices = np.arange(len(full_dataset))
+    full_dataset = datasets.ImageFolder(root=dataset_root, transform=None)
+    logging.info(f"Loaded dataset from: {dataset_root}, total samples: {len(full_dataset)}")
 
-    # 五折
-    kf = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
+    # ================================
+    # 🚀 加载 kfold_splits.pkl（包含 mean/std）
+    # ================================
+    kfold_pkl_path = os.path.join(dataset_root, "kfold_splits.pkl")
+    if not os.path.exists(kfold_pkl_path):
+        raise FileNotFoundError(f"❌ 找不到划分文件: {kfold_pkl_path}\n请先运行划分生成脚本。")
+
+    logging.info(f"✅ 加载划分文件: {kfold_pkl_path}")
+    with open(kfold_pkl_path, 'rb') as f:
+        data = pickle.load(f)
+
+    splits = data['splits']
+    fold_data = []
+
+    # ✅ 构建完整路径 → 索引 映射
+    path_to_idx = {
+        os.path.join(dataset_root, img_path).replace("\\", "/").replace("//", "/"): idx
+        for idx, (img_path, _) in enumerate(full_dataset.imgs)
+    }
+
+    for fold_idx, split in enumerate(splits):
+        rel_train_paths = split['train']
+        rel_val_paths = split['val']
+        mean = split['mean']
+        std = split['std']
+
+        # ✅ 拼接完整路径
+        full_train_paths = [
+            os.path.join(dataset_root, p).replace("\\", "/") for p in rel_train_paths
+        ]
+        full_val_paths = [
+            os.path.join(dataset_root, p).replace("\\", "/") for p in rel_val_paths
+        ]
+
+        # 映射到索引
+        train_idx = [path_to_idx[p] for p in full_train_paths if p in path_to_idx]
+        val_idx = [path_to_idx[p] for p in full_val_paths if p in path_to_idx]
+
+        # 调试输出
+        print(f"\nFold {fold_idx + 1} 路径匹配情况:")
+        print(f"  请求的训练图像数: {len(full_train_paths)}")
+        print(f"  成功映射的训练图像数: {len(train_idx)}")
+        print(f"  请求的验证图像数: {len(full_val_paths)}")
+        print(f"  成功映射的验证图像数: {len(val_idx)}")
+
+        if len(train_idx) == 0 or len(val_idx) == 0:
+            raise ValueError(f"Fold {fold_idx + 1} 的训练或验证集为空，请检查路径一致性")
+
+        fold_data.append({
+            'train_idx': train_idx,
+            'val_idx': val_idx,
+            'mean': mean,
+            'std': std
+        })
+
+    logging.info(f"✅ 成功加载 {len(fold_data)} 折划分（含 mean/std）")
+
+    # ================================
+    # 开始 K-Fold 训练
+    # ================================
     fold_results = []
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(indices), start=1):
-        print(f"\n========== Fold {fold}/{args.k_folds} ==========")
+    for fold, data in enumerate(fold_data, start=1):
+        print(f"\n========== Fold {fold}/{len(fold_data)} ==========")
+        train_idx = data['train_idx']
+        val_idx = data['val_idx']
+        mean = data['mean']
+        std = data['std']
 
-        # --- 计算当前 fold 训练集的 mean 和 std ---
-        print(f"Fold {fold}: Computing mean and std on training set...")
-        mean, std = compute_mean_std(dataset_root, train_idx, batch_size=args.batch_size, num_workers=args.num_workers)
-        logging.info(f"Fold {fold} - Computed mean: {mean}, std: {std}")
+        logging.info(f"Fold {fold} - mean: {mean}, std: {std}")
 
-        # --- 构建每折的 transform ---
+        # 数据增强与归一化
         data_transform_train = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -194,7 +240,7 @@ def main():
             transforms.Normalize(mean=mean, std=std),
         ])
 
-        # --- 为子集设置 transform ---
+        # 构建数据集
         train_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_train)
         val_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_val)
 
@@ -204,47 +250,80 @@ def main():
         train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
         val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-        # 模型 & 优化器 & 调度器
+        # 模型、优化器、损失
         model = build_resnet101(num_classes=args.num_classes).to(device)
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs // 2)  # 👈 新增调度器
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs // 2)
         loss_fn = nn.CrossEntropyLoss()
 
-        best_acc = 0.0
+        best_metrics = None
         fold_save_path = base_save_path.replace("_best.pth", f"_fold{fold}_best.pth")
 
         for epoch in range(1, args.epochs + 1):
             avg_loss = train_one_epoch(model, train_loader, device, optimizer, loss_fn)
-            val_acc = evaluate(model, val_loader, device)
-
-            scheduler.step()  # 👈 更新学习率
+            metrics = evaluate_with_metrics(model, val_loader, device, args.num_classes)
+            scheduler.step()
 
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
-                  f"Train Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
-            logging.info(f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
-                         f"Train Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | LR: {current_lr:.2e}")
+            log_msg = (f"[Fold {fold}][Epoch {epoch}/{args.epochs}] "
+                       f"Loss: {avg_loss:.4f} | "
+                       f"Acc: {metrics['acc']:.4f} | "
+                       f"Precision: {metrics['precision']:.4f} | "
+                       f"Recall: {metrics['recall']:.4f} | "
+                       f"F1: {metrics['f1']:.4f} | "
+                       f"LR: {current_lr:.2e}")
+            print(log_msg)
+            logging.info(log_msg)
 
-            if val_acc > best_acc:
-                best_acc = val_acc
+            # 保存最佳模型（以 Accuracy 为标准）
+            if best_metrics is None or metrics['acc'] > best_metrics['acc']:
+                best_metrics = metrics.copy()
                 torch.save(model.state_dict(), fold_save_path)
-                print(f"  -> Saved new best model to: {fold_save_path} (Val Acc: {best_acc:.4f})")
-                logging.info(f"Saved new best model to: {fold_save_path} (Val Acc: {best_acc:.4f})")
+                logging.info(f"✅ Saved best model (Acc: {metrics['acc']:.4f}) to {fold_save_path}")
 
-        fold_results.append(best_acc)
+        # 记录本折最佳指标
+        fold_results.append(best_metrics)
+        print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
-    # 汇总
-    avg_acc = float(np.mean(fold_results))
-    var_acc = float(np.var(fold_results))
+    # ================================
+    # 汇总结果
+    # ================================
+    all_acc = [r['acc'] for r in fold_results]
+    all_prec = [r['precision'] for r in fold_results]
+    all_rec = [r['recall'] for r in fold_results]
+    all_f1 = [r['f1'] for r in fold_results]
+
+    summary = {
+        "Average Accuracy": float(np.mean(all_acc)),
+        "Std Accuracy": float(np.std(all_acc)),
+        "Average Precision": float(np.mean(all_prec)),
+        "Average Recall": float(np.mean(all_rec)),
+        "Average F1": float(np.mean(all_f1)),
+        "Per-fold Results": [
+            {
+                "fold": i + 1,
+                "acc": r['acc'],
+                "precision": r['precision'],
+                "recall": r['recall'],
+                "f1": r['f1']
+            }
+            for i, r in enumerate(fold_results)
+        ]
+    }
+
+    # 打印汇总
     print("\n========== Cross-Validation Results ==========")
-    print(f"Per-fold best accuracies: {fold_results}")
-    print(f"Average accuracy across all folds: {avg_acc:.4f}")
-    print(f"Variance of accuracy across all folds: {var_acc:.4f}")
-    logging.info(f"Per-fold best accuracies: {fold_results}")
-    logging.info(f"Average accuracy across all folds: {avg_acc:.4f}")
-    logging.info(f"Variance of accuracy across all folds: {var_acc:.4f}")
-    logging.info("Finished Training")
-    print("Finished Training")
+    for k, v in summary.items():
+        if k != "Per-fold Results":
+            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+    # 保存汇总
+    summary_path = os.path.join(log_dir, "cv_summary.json")
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=4, ensure_ascii=False)
+
+    logging.info(f"✅ CV Summary saved to: {summary_path}")
+    logging.info("✅ Training completed.")
 
 
 if __name__ == "__main__":

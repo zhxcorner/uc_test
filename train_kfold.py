@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
 import json
@@ -9,10 +10,11 @@ import torch.nn as nn
 from torchvision import transforms, datasets
 import torch.optim as optim
 from tqdm import tqdm
-from sklearn.model_selection import KFold
 from torch.utils.data import DataLoader, Subset
 import random
 import numpy as np
+from collections import defaultdict
+import pickle
 # 动态导入模型
 from MedMamba import VSSM as vssm
 from MedMamba import VSSMEdgeEnhanced as edge_enhanced
@@ -26,32 +28,14 @@ MODEL_MAP = {
     'dual_branch': dual_branch,
     'dual_branch_enhanced': dual_branch_enhanced,
 }
-def compute_mean_std(dataset_root, indices, transform, batch_size=32, num_workers=4):
-    temp_dataset = datasets.ImageFolder(root=dataset_root, transform=transform)
-    subset = Subset(temp_dataset, indices)
-    loader = DataLoader(subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    mean = torch.zeros(3)
-    std = torch.zeros(3)
-    total_images = 0
-
-    with torch.no_grad():
-        for images, _ in loader:
-            batch_size = images.size(0)
-            mean += images.mean(dim=[0, 2, 3]) * batch_size
-            std += images.std(dim=[0, 2, 3]) * batch_size
-            total_images += batch_size
-
-    mean /= total_images
-    std /= total_images
-
-    return mean.tolist(), std.tolist()
-
+# ========== Utils ==========
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 def setup_logger_and_saver(model_name="UC"):
     current_time = time.strftime("%Y%m%d-%H%M%S")
@@ -76,20 +60,44 @@ def setup_logger_and_saver(model_name="UC"):
     return log_dir, model_save_path
 
 
-def evaluate_model(model, data_loader, device, dataset_size):
+@torch.no_grad()
+def evaluate_with_metrics(model, loader, device, num_classes):
+    """
+    多指标评估：Accuracy, Precision, Recall, F1 (weighted)
+    """
     model.eval()
-    acc = 0.0
-    with torch.no_grad():
-        test_bar = tqdm(data_loader, file=sys.stdout, desc="Validating")
-        for images, labels in test_bar:
-            outputs = model(images.to(device))
-            predict_y = torch.max(outputs, dim=1)[1]
-            acc += torch.eq(predict_y, labels.to(device)).sum().item()
+    all_preds = []
+    all_labels = []
 
-    accuracy = acc / dataset_size
-    return accuracy
+    pbar = tqdm(loader, desc="Evaluating", leave=False, file=sys.stdout)
+    for images, labels in pbar:
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+    acc = accuracy_score(all_labels, all_preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_preds, average='weighted', zero_division=0
+    )
+
+    return {
+        'acc': acc,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
 
 
+# ========== Main ==========
 def main():
     parser = argparse.ArgumentParser(description="Train MedMamba Model with Model Selection and Edge Fusion Options")
     parser.add_argument('--model_type', type=str, required=True,
@@ -114,82 +122,120 @@ def main():
     parser.add_argument('--dataset', type=str, default='单个细胞分类数据集二分类S2L')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
-    args = parser.parse_args()
-    seed_everything()
-    valid_params = {k: v for k, v in vars(args).items()}
+    parser.add_argument('--seed', type=int, default=42)
 
-    log_dir, save_path = setup_logger_and_saver(args.model_name)
+    args = parser.parse_args()
+    seed_everything(args.seed)
+
+    # 日志与保存
+    log_dir, base_save_path = setup_logger_and_saver(args.model_name)
     config_path = os.path.join(log_dir, "config.json")
     with open(config_path, 'w') as f:
-        json.dump(valid_params, f, indent=4)
+        json.dump(vars(args), f, indent=4)
     logging.info(f"Training parameters saved to: {config_path}")
 
-    # 数据预处理（临时用于计算 mean/std）
-    to_tensor_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor()
-    ])
-
-    # 数据预处理（最终用的）
-    data_transform_train = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.5),
-        transforms.RandomRotation(degrees=30),
-        transforms.ToTensor(),
-    ])
-    data_transform_val = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-    ])
-
-    # 加载数据集（用于分折）
-    all_data = datasets.ImageFolder(root=f"/data/{args.dataset}", transform=None)
-    indices = np.arange(len(all_data))  # 修正：原代码中 full_dataset 未定义
-
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    # 设备
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print("using {} device.".format(device))
+    print(f"Using device: {device}")
 
+    # 数据集路径
+    dataset_root = f"/data/{args.dataset}"
+    full_dataset = datasets.ImageFolder(root=dataset_root, transform=None)
+    logging.info(f"Loaded dataset from: {dataset_root}, total samples: {len(full_dataset)}")
+
+    # ================================
+    # 🚀 加载 kfold_splits.pkl（包含 mean/std 和相对路径）
+    # ================================
+    kfold_pkl_path = os.path.join(dataset_root, "kfold_splits.pkl")
+    if not os.path.exists(kfold_pkl_path):
+        raise FileNotFoundError(f"❌ 找不到划分文件: {kfold_pkl_path}\n请先运行划分生成脚本。")
+
+    logging.info(f"✅ 加载划分文件: {kfold_pkl_path}")
+    with open(kfold_pkl_path, 'rb') as f:
+        data = pickle.load(f)
+
+    splits = data['splits']
+    fold_data = []
+
+    # 构建完整路径 → 索引 映射
+    path_to_idx = {
+        os.path.join(dataset_root, img_path).replace("\\", "/").replace("//", "/"): idx
+        for idx, (img_path, _) in enumerate(full_dataset.imgs)
+    }
+
+    for fold_idx, split in enumerate(splits):
+        rel_train_paths = split['train']
+        rel_val_paths = split['val']
+        mean = split['mean']
+        std = split['std']
+
+        # 拼接完整路径
+        full_train_paths = [
+            os.path.join(dataset_root, p).replace("\\", "/") for p in rel_train_paths
+        ]
+        full_val_paths = [
+            os.path.join(dataset_root, p).replace("\\", "/") for p in rel_val_paths
+        ]
+
+        # 映射到索引
+        train_idx = [path_to_idx[p] for p in full_train_paths if p in path_to_idx]
+        val_idx = [path_to_idx[p] for p in full_val_paths if p in path_to_idx]
+
+        # 调试输出
+        print(f"\nFold {fold_idx + 1} 路径匹配情况:")
+        print(f"  请求的训练图像数: {len(full_train_paths)}")
+        print(f"  成功映射的训练图像数: {len(train_idx)}")
+        print(f"  请求的验证图像数: {len(full_val_paths)}")
+        print(f"  成功映射的验证图像数: {len(val_idx)}")
+
+        if len(train_idx) == 0 or len(val_idx) == 0:
+            raise ValueError(f"Fold {fold_idx + 1} 的训练或验证集为空，请检查路径一致性")
+
+        fold_data.append({
+            'train_idx': train_idx,
+            'val_idx': val_idx,
+            'mean': mean,
+            'std': std
+        })
+
+    logging.info(f"✅ 成功加载 {len(fold_data)} 折划分（含 mean/std）")
+
+    # ================================
+    # 开始 K-Fold 训练
+    # ================================
     fold_results = []
-    for fold, (train_idx, val_idx) in enumerate(kf.split(indices)):
-        print(f"Fold {fold + 1}/5")
 
-        # --- 计算当前 fold 训练集的 mean 和 std ---
-        mean, std = compute_mean_std(
-            dataset_root=f"/data/{args.dataset}",
-            indices=train_idx,
-            transform=to_tensor_transform,
-            batch_size=args.batch_size,
-            num_workers=4
-        )
-        logging.info(f"Fold {fold+1} - Computed mean: {mean}, std: {std}")
+    for fold, data in enumerate(fold_data, start=1):
+        print(f"\n========== Fold {fold}/{len(fold_data)} ==========")
+        train_idx = data['train_idx']
+        val_idx = data['val_idx']
+        mean = data['mean']
+        std = data['std']
 
-        # --- 构建每折的 transform ---
-        data_transform_train_norm = transforms.Compose([
+        logging.info(f"Fold {fold} - mean: {mean}, std: {std}")
+
+        # 数据增强与归一化
+        data_transform_train = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
-        data_transform_val_norm = transforms.Compose([
+        data_transform_val = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
 
-        # 使用 KFold 索引划分训练集和验证集
-        train_data = Subset(
-            datasets.ImageFolder(root=f"/data/{args.dataset}", transform=data_transform_train_norm),
-            train_idx
-        )
-        val_data = Subset(
-            datasets.ImageFolder(root=f"/data/{args.dataset}", transform=data_transform_val_norm),
-            val_idx
-        )
+        # 构建数据集
+        train_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_train)
+        val_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_val)
 
-        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+        train_subset = Subset(train_dataset, train_idx)
+        val_subset = Subset(val_dataset, val_idx)
+
+        train_loader = DataLoader(train_subset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
         # 构建模型
         model_class = MODEL_MAP[args.model_type]
@@ -202,7 +248,7 @@ def main():
                 'edge_attention': args.edge_attention,
                 'fusion_mode': args.fusion_mode,
             })
-        elif args.model_type == 'dual_branch' or args.model_type == 'dual_branch_enhanced':
+        elif args.model_type in ['dual_branch', 'dual_branch_enhanced']:
             model_kwargs.update({
                 'fusion_levels': args.fusion_levels,
                 'edge_attention': args.edge_attention,
@@ -218,21 +264,23 @@ def main():
 
         loss_function = nn.CrossEntropyLoss()
         optimizer = optim.Adam(net.parameters(), lr=5e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)  # 余弦退火
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs // 2)
 
-        best_acc = 0.0
-        train_steps = len(train_loader)
+        best_metrics = None
+        fold_save_path = base_save_path.replace("_best.pth", f"_fold{fold}_best.pth")
 
         for epoch in range(args.epochs):
-            # Train
+            # 训练
             net.train()
             running_loss = 0.0
             train_bar = tqdm(train_loader, file=sys.stdout, desc=f"Epoch [{epoch + 1}/{args.epochs}] Training")
-            for step, data in enumerate(train_bar):
-                images, labels = data
+            for step, (images, labels) in enumerate(train_bar):
+                images = images.to(device)
+                labels = labels.to(device)
+
                 optimizer.zero_grad()
-                outputs = net(images.to(device))
-                loss = loss_function(outputs, labels.to(device))
+                outputs = net(images)
+                loss = loss_function(outputs, labels)
                 loss.backward()
                 optimizer.step()
 
@@ -243,43 +291,66 @@ def main():
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
 
-            # Validate
-            net.eval()
-            acc = 0
-            total = 0
-            with torch.no_grad():
-                val_bar = tqdm(val_loader, file=sys.stdout, desc="Validating")
-                for val_images, val_labels in val_bar:
-                    outputs = net(val_images.to(device))
-                    predict_y = torch.max(outputs, dim=1)[1]
-                    acc += torch.eq(predict_y, val_labels.to(device)).sum().item()
-                    total += val_labels.size(0)
+            # 验证（多指标）
+            metrics = evaluate_with_metrics(net, val_loader, device, args.num_classes)
 
-            val_accurate = acc / total
-            print(f"[Epoch {epoch + 1}] Train Loss: {running_loss / train_steps:.3f} | "
-                  f"Val Acc: {val_accurate:.4f} | LR: {current_lr:.2e}")
-            logging.info('[epoch %d] train_loss: %.3f  val_accuracy: %.4f  lr: %.2e',
-                         epoch + 1, running_loss / train_steps, val_accurate, current_lr)
+            log_msg = (f"[Fold {fold}][Epoch {epoch + 1}/{args.epochs}] "
+                       f"Loss: {running_loss / len(train_loader):.3f} | "
+                       f"Acc: {metrics['acc']:.4f} | "
+                       f"Precision: {metrics['precision']:.4f} | "
+                       f"Recall: {metrics['recall']:.4f} | "
+                       f"F1: {metrics['f1']:.4f} | "
+                       f"LR: {current_lr:.2e}")
+            print(log_msg)
+            logging.info(log_msg)
 
-            if val_accurate > best_acc:
-                best_acc = val_accurate
-                torch.save(net.state_dict(), save_path.replace('best', f'best_{fold + 1}'))
-                print(f"Saved new best model with val accuracy: {best_acc:.4f}")
-                logging.info(f"Saved new best model with val accuracy: {best_acc:.4f}")
+            # 保存最佳模型（以 Accuracy 为准）
+            if best_metrics is None or metrics['acc'] > best_metrics['acc']:
+                best_metrics = metrics.copy()
+                torch.save(net.state_dict(), fold_save_path)
+                logging.info(f"✅ Saved best model (Acc: {metrics['acc']:.4f}) to {fold_save_path}")
 
-        fold_results.append(best_acc)
+        # 记录本折最佳指标
+        fold_results.append(best_metrics)
+        print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
-    # 计算五折交叉验证的平均准确率和方差
-    average_accuracy = sum(fold_results) / len(fold_results)
-    variance = sum((x - average_accuracy) ** 2 for x in fold_results) / len(fold_results)
-    print(f"Results: {fold_results}")
-    print(f"Average accuracy across all folds: {average_accuracy:.4f}")
-    print(f"Variance of accuracy across all folds: {variance:.4f}")
-    logging.info(f"Average accuracy across all folds: {average_accuracy:.4f}")
-    logging.info(f"Variance of accuracy across all folds: {variance:.4f}")
+    # ================================
+    # 汇总结果
+    # ================================
+    all_acc = [r['acc'] for r in fold_results]
+    all_prec = [r['precision'] for r in fold_results]
+    all_rec = [r['recall'] for r in fold_results]
+    all_f1 = [r['f1'] for r in fold_results]
 
-    logging.info('Finished Training')
-    print('Finished Training')
+    summary = {
+        "Average Accuracy": float(np.mean(all_acc)),
+        "Std Accuracy": float(np.std(all_acc)),
+        "Average Precision": float(np.mean(all_prec)),
+        "Average Recall": float(np.mean(all_rec)),
+        "Average F1": float(np.mean(all_f1)),
+        "Per-fold Results": [
+            {
+                "fold": i + 1,
+                "acc": r['acc'],
+                "precision": r['precision'],
+                "recall": r['recall'],
+                "f1": r['f1']
+            }
+            for i, r in enumerate(fold_results)
+        ]
+    }
+
+    print("\n========== Cross-Validation Results ==========")
+    for k, v in summary.items():
+        if k != "Per-fold Results":
+            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+
+    summary_path = os.path.join(log_dir, "cv_summary.json")
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, indent=4, ensure_ascii=False)
+
+    logging.info(f"✅ CV Summary saved to: {summary_path}")
+    logging.info("✅ Training completed.")
 
 
 if __name__ == '__main__':
