@@ -124,8 +124,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=42)
 
+
     args = parser.parse_args()
-    seed_everything(args.seed)
+    # seed_everything(args.seed)
 
     # 日志与保存
     log_dir, base_save_path = setup_logger_and_saver(args.model_name)
@@ -263,11 +264,13 @@ def main():
         ).to(device)
 
         loss_function = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(net.parameters(), lr=5e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs // 2)
+        optimizer = optim.AdamW(net.parameters(), lr=1e-4, weight_decay=0.05)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
         best_metrics = None
         fold_save_path = base_save_path.replace("_best.pth", f"_fold{fold}_best.pth")
+        best_acc = -float('inf')
+        epochs_no_improve = 0
 
         for epoch in range(args.epochs):
             # 训练
@@ -305,10 +308,21 @@ def main():
             logging.info(log_msg)
 
             # 保存最佳模型（以 Accuracy 为准）
-            if best_metrics is None or metrics['acc'] > best_metrics['acc']:
+            # [ES] Save best and update patience counter (Accuracy-based)
+            improved = metrics['acc'] > best_acc
+            if best_metrics is None or improved:
+                best_acc = metrics['acc']
                 best_metrics = metrics.copy()
+                epochs_no_improve = 0
                 torch.save(net.state_dict(), fold_save_path)
                 logging.info(f"✅ Saved best model (Acc: {metrics['acc']:.4f}) to {fold_save_path}")
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= 10:
+                    logging.info(
+                        f"⏹ Early stopping on fold {fold} at epoch {epoch + 1}: "
+                    )
+                    break
 
         # 记录本折最佳指标
         fold_results.append(best_metrics)

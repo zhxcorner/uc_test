@@ -132,7 +132,7 @@ def main():
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_name", type=str, default="ResNet101")
@@ -252,12 +252,14 @@ def main():
 
         # 模型、优化器、损失
         model = build_resnet101(num_classes=args.num_classes).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs // 2)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         loss_fn = nn.CrossEntropyLoss()
 
         best_metrics = None
         fold_save_path = base_save_path.replace("_best.pth", f"_fold{fold}_best.pth")
+        best_acc = -float('inf')
+        epochs_no_improve = 0
 
         for epoch in range(1, args.epochs + 1):
             avg_loss = train_one_epoch(model, train_loader, device, optimizer, loss_fn)
@@ -276,10 +278,21 @@ def main():
             logging.info(log_msg)
 
             # 保存最佳模型（以 Accuracy 为标准）
-            if best_metrics is None or metrics['acc'] > best_metrics['acc']:
+            improved = metrics['acc'] > best_acc + args.min_delta
+            if best_metrics is None or improved:
+                best_acc = metrics['acc']
                 best_metrics = metrics.copy()
+                epochs_no_improve = 0
                 torch.save(model.state_dict(), fold_save_path)
                 logging.info(f"✅ Saved best model (Acc: {metrics['acc']:.4f}) to {fold_save_path}")
+            else:
+                epochs_no_improve += 1
+                if args.early_stop and epochs_no_improve >= args.patience:
+                    logging.info(
+                        f"⏹ Early stopping on fold {fold} at epoch {epoch}: "
+                        f"no Acc improvement ≥ {args.min_delta:.4f} for {args.patience} epochs."
+                    )
+                    break
 
         # 记录本折最佳指标
         fold_results.append(best_metrics)
