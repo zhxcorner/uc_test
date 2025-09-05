@@ -136,6 +136,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_name", type=str, default="ResNet101")
+    parser.add_argument('--early_stop', type=int, default=10)
 
     args = parser.parse_args()
     seed_everything(args.seed)
@@ -278,7 +279,7 @@ def main():
             logging.info(log_msg)
 
             # 保存最佳模型（以 Accuracy 为标准）
-            improved = metrics['acc'] > best_acc + args.min_delta
+            improved = metrics['acc'] > best_acc
             if best_metrics is None or improved:
                 best_acc = metrics['acc']
                 best_metrics = metrics.copy()
@@ -287,10 +288,9 @@ def main():
                 logging.info(f"✅ Saved best model (Acc: {metrics['acc']:.4f}) to {fold_save_path}")
             else:
                 epochs_no_improve += 1
-                if args.early_stop and epochs_no_improve >= args.patience:
+                if epochs_no_improve >= args.early_stop:
                     logging.info(
                         f"⏹ Early stopping on fold {fold} at epoch {epoch}: "
-                        f"no Acc improvement ≥ {args.min_delta:.4f} for {args.patience} epochs."
                     )
                     break
 

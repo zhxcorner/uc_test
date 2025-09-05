@@ -123,10 +123,10 @@ def main():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--seed', type=int, default=42)
-
+    parser.add_argument('--early_stop', type=int, default=10)
 
     args = parser.parse_args()
-    # seed_everything(args.seed)
+    seed_everything(args.seed)
 
     # 日志与保存
     log_dir, base_save_path = setup_logger_and_saver(args.model_name)
@@ -207,12 +207,15 @@ def main():
     fold_results = []
 
     for fold, data in enumerate(fold_data, start=1):
+        if fold == 1 or fold == 5:
+            continue
         print(f"\n========== Fold {fold}/{len(fold_data)} ==========")
         train_idx = data['train_idx']
         val_idx = data['val_idx']
         mean = data['mean']
         std = data['std']
-
+        # mean = 0.5
+        # std = 0.5
         logging.info(f"Fold {fold} - mean: {mean}, std: {std}")
 
         # 数据增强与归一化
@@ -318,7 +321,7 @@ def main():
                 logging.info(f"✅ Saved best model (Acc: {metrics['acc']:.4f}) to {fold_save_path}")
             else:
                 epochs_no_improve += 1
-                if epochs_no_improve >= 10:
+                if epochs_no_improve >= args.early_stop:
                     logging.info(
                         f"⏹ Early stopping on fold {fold} at epoch {epoch + 1}: "
                     )
