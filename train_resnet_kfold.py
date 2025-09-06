@@ -93,7 +93,7 @@ def evaluate_with_metrics(model, loader, device, num_classes):
 
     # Precision, Recall, F1 (weighted for multi-class)
     precision, recall, f1, _ = precision_recall_fscore_support(
-        all_labels, all_preds, average='weighted', zero_division=0
+        all_labels, all_preds, average='macro', zero_division=0
     )
 
     return {
@@ -310,8 +310,11 @@ def main():
         "Average Accuracy": float(np.mean(all_acc)),
         "Std Accuracy": float(np.std(all_acc)),
         "Average Precision": float(np.mean(all_prec)),
+        "Std Precision": float(np.std(all_prec)),
         "Average Recall": float(np.mean(all_rec)),
+        "Std Recall": float(np.std(all_rec)),
         "Average F1": float(np.mean(all_f1)),
+        "Std F1": float(np.std(all_f1)),
         "Per-fold Results": [
             {
                 "fold": i + 1,
@@ -324,13 +327,11 @@ def main():
         ]
     }
 
-    # 打印汇总
     print("\n========== Cross-Validation Results ==========")
     for k, v in summary.items():
         if k != "Per-fold Results":
             print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
 
-    # 保存汇总
     summary_path = os.path.join(log_dir, "cv_summary.json")
     with open(summary_path, 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=4, ensure_ascii=False)
