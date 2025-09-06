@@ -27,7 +27,7 @@ def seed_everything(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
 
 
-def setup_logger_and_saver(model_name="ResNet101"):
+def setup_logger_and_saver(model_name="resnet50"):
     current_time = time.strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join("../logs", current_time)
     os.makedirs(log_dir, exist_ok=True)
@@ -48,18 +48,68 @@ def setup_logger_and_saver(model_name="ResNet101"):
     return log_dir, model_save_path
 
 
-def build_resnet101(num_classes: int = 2, pretrained: bool = False):
-    if pretrained:
-        try:
-            weights = models.ResNet101_Weights.IMAGENET1K_V2
-        except AttributeError:
-            weights = "IMAGENET1K_V2"
-        model = models.resnet101(weights=weights)
-    else:
-        model = models.resnet101(weights=None)
+def build_model(model_name: str, num_classes: int = 2):
+    """
+    从头构建模型（不加载预训练权重），仅支持：
+    - ResNet: resnet18, resnet34, resnet50, resnet101, resnet152
+    - ConvNeXt: convnext_tiny, convnext_small, convnext_base, convnext_large
+    - ViT: vit_b_16, vit_b_32, vit_l_16, vit_l_32
+    - Swin: swin_t, swin_s, swin_b, swin_v2_t, swin_v2_s, swin_v2_b
+    """
+    model_map = {
+        # ========== ResNet ==========
+        'resnet18': models.resnet18,
+        'resnet34': models.resnet34,
+        'resnet50': models.resnet50,
+        'resnet101': models.resnet101,
+        'resnet152': models.resnet152,
 
-    in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, num_classes)
+        # ========== ConvNeXt ==========
+        'convnext_tiny': models.convnext_tiny,
+        'convnext_small': models.convnext_small,
+        'convnext_base': models.convnext_base,
+        'convnext_large': models.convnext_large,
+
+        # ========== ViT ==========
+        'vit_b_16': models.vit_b_16,
+        'vit_b_32': models.vit_b_32,
+        'vit_l_16': models.vit_l_16,
+        'vit_l_32': models.vit_l_32,
+
+        # ========== Swin Transformer ==========
+        'swin_t': models.swin_t,
+        'swin_s': models.swin_s,
+        'swin_b': models.swin_b,
+        'swin_v2_t': models.swin_v2_t,
+        'swin_v2_s': models.swin_v2_s,
+        'swin_v2_b': models.swin_v2_b,
+    }
+
+    if model_name not in model_map:
+        raise ValueError(f"❌ 不支持的模型: {model_name}。支持列表: {list(model_map.keys())}")
+
+    # 🚫 不加载预训练权重，直接从头初始化
+    model = model_map[model_name](weights=None)
+
+    # ========== 自动替换分类头 ==========
+    if hasattr(model, 'fc'):  # ResNet
+        in_features = model.fc.in_features
+        model.fc = nn.Linear(in_features, num_classes)
+
+    elif hasattr(model, 'classifier'):  # ConvNeXt
+        if isinstance(model.classifier, nn.Sequential):
+            in_features = model.classifier[-1].in_features
+            model.classifier[-1] = nn.Linear(in_features, num_classes)
+        else:
+            in_features = model.classifier.in_features
+            model.classifier = nn.Linear(in_features, num_classes)
+
+    elif hasattr(model, 'heads'):  # ViT, Swin
+        in_features = model.heads.head.in_features
+        model.heads.head = nn.Linear(in_features, num_classes)
+
+    else:
+        raise NotImplementedError(f"❌ 未实现分类头替换逻辑: {model_name}")
 
     return model
 
@@ -91,7 +141,7 @@ def evaluate_with_metrics(model, loader, device, num_classes):
     # Accuracy
     acc = accuracy_score(all_labels, all_preds)
 
-    # Precision, Recall, F1 (weighted for multi-class)
+    # Precision, Recall, F1 (macro average for multi-class)
     precision, recall, f1, _ = precision_recall_fscore_support(
         all_labels, all_preds, average='macro', zero_division=0
     )
@@ -127,7 +177,7 @@ def train_one_epoch(model, loader, device, optimizer, loss_fn):
 
 # ========== Main ==========
 def main():
-    parser = argparse.ArgumentParser(description="Train ResNet101 with 5-Fold Cross Validation")
+    parser = argparse.ArgumentParser(description="Train ResNet/ConvNeXt/ViT/Swin with 5-Fold Cross Validation")
     parser.add_argument("--dataset", type=str, default="单个细胞分类数据集二分类S2L", help="ImageFolder 根目录名（挂载在 /data 下）")
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=100)
@@ -135,7 +185,15 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--model_name", type=str, default="ResNet101")
+    parser.add_argument("--model_name", type=str, default="resnet50",
+                        choices=[
+                            'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152',
+                            'convnext_tiny', 'convnext_small', 'convnext_base', 'convnext_large',
+                            'vit_b_16', 'vit_b_32', 'vit_l_16', 'vit_l_32',
+                            'swin_t', 'swin_s', 'swin_b',
+                            'swin_v2_t', 'swin_v2_s', 'swin_v2_b',
+                        ],
+                        help="模型名称，支持 ResNet / ConvNeXt / ViT / Swin（从头训练）")
     parser.add_argument('--early_stop', type=int, default=10)
 
     args = parser.parse_args()
@@ -228,7 +286,7 @@ def main():
 
         logging.info(f"Fold {fold} - mean: {mean}, std: {std}")
 
-        # 数据增强与归一化
+        # 数据增强与归一化（统一 224x224）
         data_transform_train = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
@@ -252,7 +310,12 @@ def main():
         val_loader = DataLoader(val_subset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
         # 模型、优化器、损失
-        model = build_resnet101(num_classes=args.num_classes).to(device)
+        model = build_model(args.model_name, num_classes=args.num_classes).to(device)
+
+        # 💡 打印参数量（本地计算，无 thop 依赖）
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"✅ 使用模型: {args.model_name} | 总参数量: {total_params / 1e6:.2f}M")
+
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         loss_fn = nn.CrossEntropyLoss()
@@ -289,9 +352,7 @@ def main():
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= args.early_stop:
-                    logging.info(
-                        f"⏹ Early stopping on fold {fold} at epoch {epoch}: "
-                    )
+                    logging.info(f"⏹ Early stopping on fold {fold} at epoch {epoch}")
                     break
 
         # 记录本折最佳指标
@@ -299,33 +360,17 @@ def main():
         print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
     # ================================
-    # 汇总结果（包含模型复杂度）
+    # 汇总结果（不计算 FLOPs，仅记录参数量）
     # ================================
     all_acc = [r['acc'] for r in fold_results]
     all_prec = [r['precision'] for r in fold_results]
     all_rec = [r['recall'] for r in fold_results]
     all_f1 = [r['f1'] for r in fold_results]
 
-    # 🔽 只在最后计算一次模型复杂度（FLOPs & Params）🔽
-    try:
-        from thop import profile
-        # 重建一次模型（结构一致即可）
-        model_for_analysis = build_resnet101(num_classes=args.num_classes).to(device)
-        input_tensor = torch.randn(1, 3, 224, 224).to(device)
-        flops, params = profile(model_for_analysis, inputs=(input_tensor,), verbose=False)
-        flops_str = f"{flops / 1e9:.3f}G" if flops > 1e9 else f"{flops / 1e6:.3f}M"
-        params_str = f"{params / 1e6:.3f}M" if params > 1e6 else f"{params / 1e3:.3f}K"
-        logging.info(f"📊 Model Complexity (ResNet101): FLOPs={flops_str}, Parameters={params_str}")
-    except Exception as e:
-        logging.warning(f"⚠️ Failed to compute model complexity: {e}")
-        flops_str = "N/A"
-        params_str = "N/A"
-    # 🔼 结束添加
-
-    # 构建 summary
+    # 构建 summary（不包含 FLOPs）
     summary = {
-        "Model FLOPs": flops_str,
-        "Model Parameters": params_str,
+        "Model Name": args.model_name,
+        "Model Parameters (M)": round(total_params / 1e6, 3),  # 使用最后一次构建的模型参数量
         "Average Accuracy": float(np.mean(all_acc)),
         "Std Accuracy": float(np.std(all_acc)),
         "Average Precision": float(np.mean(all_prec)),
@@ -348,15 +393,17 @@ def main():
 
     print("\n========== Cross-Validation Results ==========")
     for k, v in summary.items():
-        if k != "Per-fold Results":
-            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+        if k != "Per-fold Results" and isinstance(v, float):
+            print(f"{k}: {v:.4f}")
+        elif k != "Per-fold Results":
+            print(f"{k}: {v}")
 
     summary_path = os.path.join(log_dir, "cv_summary.json")
     with open(summary_path, 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=4, ensure_ascii=False)
 
     logging.info(f"✅ CV Summary saved to: {summary_path}")
-    logging.info("✅ Training completed.")
+    logging.info("✅ Training completed. 如需计算 FLOPs，请运行 model_complexity.py")
 
 
 if __name__ == "__main__":

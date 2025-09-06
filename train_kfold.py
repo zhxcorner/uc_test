@@ -15,6 +15,7 @@ import random
 import numpy as np
 from collections import defaultdict
 import pickle
+
 # 动态导入模型
 from MedMamba import VSSM as vssm
 from MedMamba import VSSMEdgeEnhanced as edge_enhanced
@@ -27,6 +28,13 @@ MODEL_MAP = {
     'edge_enhanced': edge_enhanced,
     'dual_branch': dual_branch,
     'dual_branch_enhanced': dual_branch_enhanced,
+}
+
+# 尺寸配置映射
+SIZE_CONFIG = {
+    't': {'depths': [2, 2, 4, 2], 'dims': [96, 192, 384, 768]},
+    's': {'depths': [2, 2, 8, 2], 'dims': [96, 192, 384, 768]},
+    'b': {'depths': [2, 2, 12, 2], 'dims': [128, 256, 512, 1024]},
 }
 
 # ========== Utils ==========
@@ -62,9 +70,6 @@ def setup_logger_and_saver(model_name="UC"):
 
 @torch.no_grad()
 def evaluate_with_metrics(model, loader, device, num_classes):
-    """
-    多指标评估：Accuracy, Precision, Recall, F1 (weighted)
-    """
     model.eval()
     all_preds = []
     all_labels = []
@@ -107,6 +112,8 @@ def main():
                         help='Number of output classes (default: 2)')
     parser.add_argument('--model_name', type=str, default='UC',
                         help='Model name for saving (default: UC)')
+    parser.add_argument('--size', type=str, default='t', choices=['t', 's', 'b'],
+                        help='Model size: t(tiny), s(small), b(base)')
 
     # 边缘增强相关参数
     parser.add_argument('--edge_layer_idx', type=int, default=0,
@@ -207,15 +214,11 @@ def main():
     fold_results = []
 
     for fold, data in enumerate(fold_data, start=1):
-        if fold == 1 or fold == 5:
-            continue
         print(f"\n========== Fold {fold}/{len(fold_data)} ==========")
         train_idx = data['train_idx']
         val_idx = data['val_idx']
         mean = data['mean']
         std = data['std']
-        # mean = 0.5
-        # std = 0.5
         logging.info(f"Fold {fold} - mean: {mean}, std: {std}")
 
         # 数据增强与归一化
@@ -259,12 +262,18 @@ def main():
                 'fusion_mode': args.fusion_mode,
             })
 
+        # 根据 size 选择配置
+        size_config = SIZE_CONFIG[args.size]
         net = model_class(
-            depths=[2, 2, 4, 2],
-            dims=[96, 192, 384, 768],
+            depths=size_config['depths'],
+            dims=size_config['dims'],
             num_classes=args.num_classes,
             **model_kwargs
         ).to(device)
+
+        # 打印参数量
+        total_params = sum(p.numel() for p in net.parameters())
+        print(f"✅ 使用模型: {args.model_type} ({args.size}) | 总参数量: {total_params / 1e6:.2f}M")
 
         loss_function = nn.CrossEntropyLoss()
         optimizer = optim.AdamW(net.parameters(), lr=1e-4, weight_decay=0.05)
@@ -311,7 +320,6 @@ def main():
             logging.info(log_msg)
 
             # 保存最佳模型（以 Accuracy 为准）
-            # [ES] Save best and update patience counter (Accuracy-based)
             improved = metrics['acc'] > best_acc
             if best_metrics is None or improved:
                 best_acc = metrics['acc']
@@ -322,9 +330,7 @@ def main():
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve >= args.early_stop:
-                    logging.info(
-                        f"⏹ Early stopping on fold {fold} at epoch {epoch + 1}: "
-                    )
+                    logging.info(f"⏹ Early stopping on fold {fold} at epoch {epoch + 1}")
                     break
 
         # 记录本折最佳指标
@@ -332,53 +338,19 @@ def main():
         print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
     # ================================
-    # 汇总结果（包含模型复杂度）
+    # 汇总结果（不计算 FLOPs）
     # ================================
     all_acc = [r['acc'] for r in fold_results]
     all_prec = [r['precision'] for r in fold_results]
     all_rec = [r['recall'] for r in fold_results]
     all_f1 = [r['f1'] for r in fold_results]
 
-    # 临时构建一次模型，用于计算 FLOPs 和 Parameters（只在 CPU/GPU 上临时用）
-    try:
-        from thop import profile
-        model_class = MODEL_MAP[args.model_type]
-        model_kwargs = {}
-
-        if args.model_type == 'edge_enhanced':
-            model_kwargs.update({
-                'edge_layer_idx': args.edge_layer_idx,
-                'fusion_levels': args.fusion_levels,
-                'edge_attention': args.edge_attention,
-                'fusion_mode': args.fusion_mode,
-            })
-        elif args.model_type in ['dual_branch', 'dual_branch_enhanced']:
-            model_kwargs.update({
-                'fusion_levels': args.fusion_levels,
-                'edge_attention': args.edge_attention,
-                'fusion_mode': args.fusion_mode,
-            })
-
-        net_for_flops = model_class(
-            depths=[2, 2, 4, 2],
-            dims=[96, 192, 384, 768],
-            num_classes=args.num_classes,
-            **model_kwargs
-        ).to(device)
-
-        input_tensor = torch.randn(1, 3, 224, 224).to(device)
-        flops, params = profile(net_for_flops, inputs=(input_tensor,), verbose=False)
-        flops_str = f"{flops / 1e9:.3f}G" if flops > 1e9 else f"{flops / 1e6:.3f}M"
-        params_str = f"{params / 1e6:.3f}M" if params > 1e6 else f"{params / 1e3:.3f}K"
-    except Exception as e:
-        logging.warning(f"⚠️ Could not compute model complexity: {e}")
-        flops_str = "N/A"
-        params_str = "N/A"
-
-    # 构建 summary
+    # 构建 summary（FLOPs 占位，后续由独立脚本填充）
     summary = {
-        "Model FLOPs": flops_str,
-        "Model Parameters": params_str,
+        "Model Type": args.model_type,
+        "Model Size": args.size,
+        "Model Parameters (M)": round(total_params / 1e6, 3),
+        "Model FLOPs": "RUN model_complexity_medmamba.py TO COMPUTE",
         "Average Accuracy": float(np.mean(all_acc)),
         "Std Accuracy": float(np.std(all_acc)),
         "Average Precision": float(np.mean(all_prec)),
@@ -413,7 +385,7 @@ def main():
         json.dump(summary, f, indent=4, ensure_ascii=False)
 
     logging.info(f"✅ CV Summary saved to: {summary_path}")
-    logging.info("✅ Training completed.")
+    logging.info("✅ Training completed. 如需计算 FLOPs，请运行 model_complexity_medmamba.py")
 
 
 if __name__ == '__main__':
