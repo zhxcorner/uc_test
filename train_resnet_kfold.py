@@ -299,14 +299,33 @@ def main():
         print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
     # ================================
-    # 汇总结果
+    # 汇总结果（包含模型复杂度）
     # ================================
     all_acc = [r['acc'] for r in fold_results]
     all_prec = [r['precision'] for r in fold_results]
     all_rec = [r['recall'] for r in fold_results]
     all_f1 = [r['f1'] for r in fold_results]
 
+    # 🔽 只在最后计算一次模型复杂度（FLOPs & Params）🔽
+    try:
+        from thop import profile
+        # 重建一次模型（结构一致即可）
+        model_for_analysis = build_resnet101(num_classes=args.num_classes).to(device)
+        input_tensor = torch.randn(1, 3, 224, 224).to(device)
+        flops, params = profile(model_for_analysis, inputs=(input_tensor,), verbose=False)
+        flops_str = f"{flops / 1e9:.3f}G" if flops > 1e9 else f"{flops / 1e6:.3f}M"
+        params_str = f"{params / 1e6:.3f}M" if params > 1e6 else f"{params / 1e3:.3f}K"
+        logging.info(f"📊 Model Complexity (ResNet101): FLOPs={flops_str}, Parameters={params_str}")
+    except Exception as e:
+        logging.warning(f"⚠️ Failed to compute model complexity: {e}")
+        flops_str = "N/A"
+        params_str = "N/A"
+    # 🔼 结束添加
+
+    # 构建 summary
     summary = {
+        "Model FLOPs": flops_str,
+        "Model Parameters": params_str,
         "Average Accuracy": float(np.mean(all_acc)),
         "Std Accuracy": float(np.std(all_acc)),
         "Average Precision": float(np.mean(all_prec)),

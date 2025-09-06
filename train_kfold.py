@@ -332,14 +332,53 @@ def main():
         print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
     # ================================
-    # 汇总结果
+    # 汇总结果（包含模型复杂度）
     # ================================
     all_acc = [r['acc'] for r in fold_results]
     all_prec = [r['precision'] for r in fold_results]
     all_rec = [r['recall'] for r in fold_results]
     all_f1 = [r['f1'] for r in fold_results]
 
+    # 临时构建一次模型，用于计算 FLOPs 和 Parameters（只在 CPU/GPU 上临时用）
+    try:
+        from thop import profile
+        model_class = MODEL_MAP[args.model_type]
+        model_kwargs = {}
+
+        if args.model_type == 'edge_enhanced':
+            model_kwargs.update({
+                'edge_layer_idx': args.edge_layer_idx,
+                'fusion_levels': args.fusion_levels,
+                'edge_attention': args.edge_attention,
+                'fusion_mode': args.fusion_mode,
+            })
+        elif args.model_type in ['dual_branch', 'dual_branch_enhanced']:
+            model_kwargs.update({
+                'fusion_levels': args.fusion_levels,
+                'edge_attention': args.edge_attention,
+                'fusion_mode': args.fusion_mode,
+            })
+
+        net_for_flops = model_class(
+            depths=[2, 2, 4, 2],
+            dims=[96, 192, 384, 768],
+            num_classes=args.num_classes,
+            **model_kwargs
+        ).to(device)
+
+        input_tensor = torch.randn(1, 3, 224, 224).to(device)
+        flops, params = profile(net_for_flops, inputs=(input_tensor,), verbose=False)
+        flops_str = f"{flops / 1e9:.3f}G" if flops > 1e9 else f"{flops / 1e6:.3f}M"
+        params_str = f"{params / 1e6:.3f}M" if params > 1e6 else f"{params / 1e3:.3f}K"
+    except Exception as e:
+        logging.warning(f"⚠️ Could not compute model complexity: {e}")
+        flops_str = "N/A"
+        params_str = "N/A"
+
+    # 构建 summary
     summary = {
+        "Model FLOPs": flops_str,
+        "Model Parameters": params_str,
         "Average Accuracy": float(np.mean(all_acc)),
         "Std Accuracy": float(np.std(all_acc)),
         "Average Precision": float(np.mean(all_prec)),
