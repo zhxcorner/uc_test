@@ -50,61 +50,96 @@ def setup_logger_and_saver(model_name="resnet50"):
 
 def build_model(model_name: str, num_classes: int = 2):
     """
-    从头构建模型（不加载预训练权重），仅支持：
-    - ResNet: resnet18, resnet34, resnet50, resnet101, resnet152
-    - ConvNeXt: convnext_tiny, convnext_small, convnext_base, convnext_large
-    - ViT: vit_b_16, vit_b_32, vit_l_16, vit_l_32
-    - Swin: swin_t, swin_s, swin_b, swin_v2_t, swin_v2_s, swin_v2_b
+    仅支持：
+    - ResNet: resnet18, resnet34, resnet101
+    - ConvNeXt: convnext_t, convnext_s, convnext_b   (映射到 tiny/small/base)
+    - EfficientNet: efficientnet_b3, efficientnet_b4, efficientnet_b6
+    - DenseNet: densenet169, densenet201, densenet161
+    - ViT: vit_t, vit_s, vit_b                        (通过 timm: tiny/small/base)
+    - Swin: swin_t, swin_s, swin_b
     """
+    from torchvision import models as tvm
+
+    # --- ViT(t/s/b) 用 timm，避免手动改 classifier ---
+    TIMM_VIT_NAMES = {
+        'vit_t': 'vit_tiny_patch16_224',
+        'vit_s': 'vit_small_patch16_224',
+        'vit_b': 'vit_base_patch16_224',
+    }
+    if model_name in TIMM_VIT_NAMES:
+        try:
+            import timm
+        except Exception as e:
+            raise ImportError("使用 vit_t/vit_s/vit_b 需要安装 timm： pip install timm") from e
+        model = timm.create_model(TIMM_VIT_NAMES[model_name], pretrained=False, num_classes=num_classes)
+        return model
+
+    # 其余型号均用 torchvision
     model_map = {
-        # ========== ResNet ==========
-        'resnet18': models.resnet18,
-        'resnet34': models.resnet34,
-        'resnet50': models.resnet50,
-        'resnet101': models.resnet101,
-        'resnet152': models.resnet152,
+        # -------- ResNet ----------
+        'resnet18':  tvm.resnet18,
+        'resnet34':  tvm.resnet34,
+        'resnet101': tvm.resnet101,
 
-        # ========== ConvNeXt ==========
-        'convnext_tiny': models.convnext_tiny,
-        'convnext_small': models.convnext_small,
-        'convnext_base': models.convnext_base,
-        'convnext_large': models.convnext_large,
+        # -------- ConvNeXt (t/s/b -> tiny/small/base) ----------
+        'convnext_t': tvm.convnext_tiny,
+        'convnext_s': tvm.convnext_small,
+        'convnext_b': tvm.convnext_base,
 
-        # ========== ViT ==========
-        'vit_b_16': models.vit_b_16,
-        'vit_b_32': models.vit_b_32,
-        'vit_l_16': models.vit_l_16,
-        'vit_l_32': models.vit_l_32,
+        # -------- EfficientNet ----------
+        'efficientnet_b3': tvm.efficientnet_b3,
+        'efficientnet_b4': tvm.efficientnet_b4,
+        'efficientnet_b6': tvm.efficientnet_b6,
 
-        # ========== Swin Transformer ==========
-        'swin_t': models.swin_t,
-        'swin_s': models.swin_s,
-        'swin_b': models.swin_b,
-        'swin_v2_t': models.swin_v2_t,
-        'swin_v2_s': models.swin_v2_s,
-        'swin_v2_b': models.swin_v2_b,
+        # -------- DenseNet ----------
+        'densenet169': tvm.densenet169,
+        'densenet201': tvm.densenet201,
+        'densenet161': tvm.densenet161,
+
+        # -------- Swin ----------
+        'swin_t': tvm.swin_t,
+        'swin_s': tvm.swin_s,
+        'swin_b': tvm.swin_b,
     }
 
     if model_name not in model_map:
-        raise ValueError(f"❌ 不支持的模型: {model_name}。支持列表: {list(model_map.keys())}")
+        raise ValueError(f"❌ 不支持的模型: {model_name}")
 
-    # 🚫 不加载预训练权重，直接从头初始化
+    # 不加载预训练
     model = model_map[model_name](weights=None)
 
-    # ========== 自动替换分类头 ==========
-    if hasattr(model, 'fc'):  # ResNet
+    # --- 统一替换分类头为 num_classes ---
+    if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
+        # ResNet
         in_features = model.fc.in_features
         model.fc = nn.Linear(in_features, num_classes)
 
-    elif hasattr(model, 'classifier'):  # ConvNeXt
+    elif hasattr(model, 'classifier'):
+        # ConvNeXt / EfficientNet / DenseNet（都有 classifier）
         if isinstance(model.classifier, nn.Sequential):
-            in_features = model.classifier[-1].in_features
-            model.classifier[-1] = nn.Linear(in_features, num_classes)
+            # ConvNeXt、EfficientNet：最后一层是 Linear
+            last = model.classifier[-1]
+            if isinstance(last, nn.Linear):
+                in_features = last.in_features
+                model.classifier[-1] = nn.Linear(in_features, num_classes)
+            else:
+                # 兜底：直接替换整个 classifier
+                in_features = getattr(last, 'in_features', None)
+                if in_features is None and hasattr(model, 'num_features'):
+                    in_features = model.num_features
+                if in_features is None:
+                    raise NotImplementedError(f"无法确定 {model_name} 的分类头输入维度")
+                model.classifier = nn.Sequential(nn.Flatten(), nn.Linear(in_features, num_classes))
         else:
-            in_features = model.classifier.in_features
-            model.classifier = nn.Linear(in_features, num_classes)
+            # DenseNet: classifier 是 Linear
+            if isinstance(model.classifier, nn.Linear):
+                in_features = model.classifier.in_features
+                model.classifier = nn.Linear(in_features, num_classes)
+            else:
+                raise NotImplementedError(f"未实现 {model_name} 的 classifier 替换")
 
-    elif hasattr(model, 'heads'):  # ViT, Swin
+    elif hasattr(model, 'heads') and hasattr(model.heads, 'head'):
+        # Swin（torchvision）
         in_features = model.heads.head.in_features
         model.heads.head = nn.Linear(in_features, num_classes)
 
@@ -112,6 +147,7 @@ def build_model(model_name: str, num_classes: int = 2):
         raise NotImplementedError(f"❌ 未实现分类头替换逻辑: {model_name}")
 
     return model
+
 
 
 # ========== Evaluate (Multi-metric) ==========
@@ -185,15 +221,27 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--model_name", type=str, default="resnet50",
-                        choices=[
-                            'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152',
-                            'convnext_tiny', 'convnext_small', 'convnext_base', 'convnext_large',
-                            'vit_b_16', 'vit_b_32', 'vit_l_16', 'vit_l_32',
-                            'swin_t', 'swin_s', 'swin_b',
-                            'swin_v2_t', 'swin_v2_s', 'swin_v2_b',
-                        ],
-                        help="模型名称，支持 ResNet / ConvNeXt / ViT / Swin（从头训练）")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="resnet34",
+        choices=[
+            # ResNet
+            'resnet18', 'resnet34', 'resnet101',
+            # ConvNeXt
+            'convnext_t', 'convnext_s', 'convnext_b',
+            # EfficientNet
+            'efficientnet_b3', 'efficientnet_b4', 'efficientnet_b6',
+            # DenseNet
+            'densenet169', 'densenet201', 'densenet161',
+            # ViT (timm)
+            'vit_t', 'vit_s', 'vit_b',
+            # Swin
+            'swin_t', 'swin_s', 'swin_b',
+        ],
+        help="选择模型（默认 resnet34）"
+    )
+
     parser.add_argument('--early_stop', type=int, default=10)
 
     args = parser.parse_args()
@@ -359,9 +407,6 @@ def main():
         fold_results.append(best_metrics)
         print(f"📌 Fold {fold} Best Metrics: {best_metrics}")
 
-    # ================================
-    # 汇总结果（不计算 FLOPs，仅记录参数量）
-    # ================================
     all_acc = [r['acc'] for r in fold_results]
     all_prec = [r['precision'] for r in fold_results]
     all_rec = [r['recall'] for r in fold_results]
@@ -403,7 +448,7 @@ def main():
         json.dump(summary, f, indent=4, ensure_ascii=False)
 
     logging.info(f"✅ CV Summary saved to: {summary_path}")
-    logging.info("✅ Training completed. 如需计算 FLOPs，请运行 model_complexity.py")
+    logging.info("✅ Training completed.")
 
 
 if __name__ == "__main__":

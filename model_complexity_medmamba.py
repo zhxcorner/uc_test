@@ -69,6 +69,10 @@ def main():
 
     args = parser.parse_args()
 
+    # ========== 🚀 关键修复：统一设备 ==========
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🔧 使用设备: {device}")
+
     # 构建模型
     extra_kwargs = {}
     if args.model_type == 'edge_enhanced':
@@ -90,11 +94,12 @@ def main():
         size=args.size,
         num_classes=args.num_classes,
         **extra_kwargs
-    )
+    ).to(device)  # 🔥 移动到设备
+
     model.eval()
 
-    # 创建虚拟输入
-    input_tensor = torch.randn(1, 3, args.input_size, args.input_size)
+    # 创建虚拟输入（也移动到相同设备）
+    input_tensor = torch.randn(1, 3, args.input_size, args.input_size).to(device)  # 🔥 关键！
 
     # 计算 FLOPs 和 Params
     try:
@@ -111,7 +116,8 @@ def main():
             "parameters": params_str,
             "flops": flops_str,
             "parameters_raw": int(params),
-            "flops_raw": int(flops)
+            "flops_raw": int(flops),
+            "computed_on_device": str(device)
         }
 
         print("="*60)
@@ -119,19 +125,14 @@ def main():
         print(f"   Model Type: {args.model_type}")
         print(f"   Size: {args.size}")
         print(f"   Input: {args.input_size}x{args.input_size}")
+        print(f"   Device: {device}")
         print(f"   Parameters: {params_str}")
         print(f"   FLOPs: {flops_str}")
         print("="*60)
 
-        # 保存结果
-        filename = f"medmamba_{args.model_type}_{args.size}_complexity.json"
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=4, ensure_ascii=False)
-        print(f"💾 结果已保存到: {filename}")
 
     except Exception as e:
         print(f"❌ 计算失败: {e}")
-        print("请确保已安装: pip install thop")
 
 
 if __name__ == "__main__":
