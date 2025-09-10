@@ -217,8 +217,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="单个细胞分类数据集二分类S2L", help="ImageFolder 根目录名（挂载在 /data 下）")
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -338,6 +338,8 @@ def main():
         data_transform_train = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),  # 👈 加垂直翻转
+            transforms.RandomRotation(degrees=15),  # 👈 加旋转
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
@@ -346,6 +348,7 @@ def main():
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
+
 
         # 构建数据集
         train_dataset = datasets.ImageFolder(root=dataset_root, transform=data_transform_train)
@@ -364,7 +367,7 @@ def main():
         total_params = sum(p.numel() for p in model.parameters())
         print(f"✅ 使用模型: {args.model_name} | 总参数量: {total_params / 1e6:.2f}M")
 
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
         loss_fn = nn.CrossEntropyLoss()
 

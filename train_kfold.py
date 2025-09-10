@@ -69,10 +69,12 @@ def setup_logger_and_saver(model_name="UC"):
 
 
 @torch.no_grad()
-def evaluate_with_metrics(model, loader, device, num_classes):
+def evaluate_with_metrics(model, loader, device, num_classes, loss_function=None):
     model.eval()
     all_preds = []
     all_labels = []
+    total_loss = 0.0
+    total_samples = 0
 
     pbar = tqdm(loader, desc="Evaluating", leave=False, file=sys.stdout)
     for images, labels in pbar:
@@ -84,6 +86,12 @@ def evaluate_with_metrics(model, loader, device, num_classes):
         all_preds.extend(preds.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
+        # 👇 如果提供了 loss_function，计算 loss
+        if loss_function is not None:
+            loss = loss_function(outputs, labels)
+            total_loss += loss.item() * images.size(0)  # 累积未平均的 loss
+            total_samples += images.size(0)
+
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
 
@@ -94,13 +102,19 @@ def evaluate_with_metrics(model, loader, device, num_classes):
         all_labels, all_preds, average='macro', zero_division=0
     )
 
-    return {
+    result = {
         'acc': acc,
         'precision': precision,
         'recall': recall,
         'f1': f1
     }
 
+    # 👇 如果计算了 loss，加入结果
+    if loss_function is not None:
+        avg_loss = total_loss / total_samples
+        result['val_loss'] = avg_loss
+
+    return result
 
 # ========== Main ==========
 def main():
@@ -128,7 +142,7 @@ def main():
                         help='Fusion method to use in edge fusion module (default: concat)')
     parser.add_argument('--dataset', type=str, default='单个细胞分类数据集二分类S2L')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--early_stop', type=int, default=10)
 
@@ -225,6 +239,8 @@ def main():
         data_transform_train = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),  # 👈 加垂直翻转
+            transforms.RandomRotation(degrees=15),  # 👈 加旋转
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
@@ -276,14 +292,29 @@ def main():
         print(f"✅ 使用模型: {args.model_type} ({args.size}) | 总参数量: {total_params / 1e6:.2f}M")
 
         loss_function = nn.CrossEntropyLoss()
-        optimizer = optim.AdamW(net.parameters(), lr=1e-4, weight_decay=0.05)
+
+        from torch.optim.lr_scheduler import SequentialLR, LinearLR
+
+        optimizer = optim.AdamW(net.parameters(), lr=5e-5, weight_decay=0.01)
+
+        # Warmup + Cosine
+        # warmup_epochs = 5
+        # scheduler1 = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+        # scheduler2 = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - warmup_epochs)
+        # scheduler = SequentialLR(optimizer, schedulers=[scheduler1, scheduler2], milestones=[warmup_epochs])
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
         best_metrics = None
         fold_save_path = base_save_path.replace("_best.pth", f"_fold{fold}_best.pth")
         best_acc = -float('inf')
         epochs_no_improve = 0
-
+        # 初始化历史记录
+        history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_acc': [],
+            'lr': []
+        }
         for epoch in range(args.epochs):
             # 训练
             net.train()
@@ -307,8 +338,12 @@ def main():
             current_lr = optimizer.param_groups[0]['lr']
 
             # 验证（多指标）
-            metrics = evaluate_with_metrics(net, val_loader, device, args.num_classes)
-
+            metrics = evaluate_with_metrics(net, val_loader, device, args.num_classes, loss_function=loss_function)
+            # 👇 记录历史数据
+            history['train_loss'].append(running_loss / len(train_loader))
+            history['val_loss'].append(metrics['val_loss'])  # 来自 evaluate_with_metrics
+            history['val_acc'].append(metrics['acc'])
+            history['lr'].append(current_lr)
             log_msg = (f"[Fold {fold}][Epoch {epoch + 1}/{args.epochs}] "
                        f"Loss: {running_loss / len(train_loader):.3f} | "
                        f"Acc: {metrics['acc']:.4f} | "
@@ -332,6 +367,44 @@ def main():
                 if epochs_no_improve >= args.early_stop:
                     logging.info(f"⏹ Early stopping on fold {fold} at epoch {epoch + 1}")
                     break
+
+        # ========== 绘制训练曲线 ==========
+        import matplotlib.pyplot as plt
+
+        epochs = range(1, len(history['train_loss']) + 1)
+
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        # 左轴：Loss
+        color_loss = 'tab:red'
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss', color=color_loss)
+        ax1.plot(epochs, history['train_loss'], color=color_loss, marker='o', linestyle='-', label='Train Loss')
+        ax1.plot(epochs, history['val_loss'], color='tab:orange', marker='x', linestyle='--', label='Val Loss')
+        ax1.tick_params(axis='y', labelcolor=color_loss)
+        ax1.grid(True, linestyle='--', alpha=0.5)
+
+        # 右轴：Accuracy
+        ax2 = ax1.twinx()
+        color_acc = 'tab:blue'
+        ax2.set_ylabel('Accuracy', color=color_acc)
+        ax2.plot(epochs, history['val_acc'], color=color_acc, marker='s', linestyle='-', label='Val Accuracy')
+        ax2.tick_params(axis='y', labelcolor=color_acc)
+
+        # 标题和图例
+        plt.title(f'Training Curve - Fold {fold} (Best Acc: {best_acc:.4f})', fontsize=14, fontweight='bold')
+        fig.tight_layout()
+
+        # 合并图例
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right', fontsize=10)
+
+        # 保存图像
+        curve_path = os.path.join(log_dir, f"fold{fold}_training_curve.png")
+        plt.savefig(curve_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logging.info(f"📈 Fold {fold} training curve saved to: {curve_path}")
 
         # 记录本折最佳指标
         fold_results.append(best_metrics)
