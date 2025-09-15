@@ -620,6 +620,63 @@ def channel_shuffle(x: Tensor, groups: int) -> Tensor:
 
     return x  # 返回混洗后的特征图
 
+# 原始
+# class SS_Conv_SSM(nn.Module):
+#     def __init__(
+#         self,
+#         hidden_dim: int = 0,
+#         drop_path: float = 0,
+#         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+#         attn_drop_rate: float = 0,
+#         d_state: int = 16,
+#         **kwargs,
+#     ):
+#         super().__init__()
+#         # 对输入右半部分特征做 LayerNorm
+#         self.ln_1 = norm_layer(hidden_dim // 2)
+#
+#         # 空间状态建模模块（SS2D），类似注意力机制的操作
+#         self.self_attention = SS2D(d_model=hidden_dim // 2, dropout=attn_drop_rate, d_state=d_state, **kwargs)
+#
+#         # DropPath，用于实现随机深度（Stochastic Depth）
+#         self.drop_path = DropPath(drop_path)
+#
+#         # 左半部分使用一组卷积模块进行局部建模：3x3 -> 3x3 -> 1x1
+#         self.conv33conv33conv11 = nn.Sequential(
+#             nn.BatchNorm2d(hidden_dim // 2),  # 批归一化
+#             nn.Conv2d(in_channels=hidden_dim // 2, out_channels=hidden_dim // 2, kernel_size=3, stride=1, padding=1),
+#             nn.BatchNorm2d(hidden_dim // 2),
+#             nn.ReLU(),
+#             nn.Conv2d(in_channels=hidden_dim // 2, out_channels=hidden_dim // 2, kernel_size=3, stride=1, padding=1),
+#             nn.BatchNorm2d(hidden_dim // 2),
+#             nn.ReLU(),
+#             nn.Conv2d(in_channels=hidden_dim // 2, out_channels=hidden_dim // 2, kernel_size=1, stride=1),
+#             nn.ReLU()
+#         )
+#
+#         # 下面是注释掉的最终 1x1 卷积（未使用）
+#         # self.finalconv11 = nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1)
+#
+#     def forward(self, input: torch.Tensor):
+#         # 将输入在最后一维平均分为左右两部分
+#         input_left, input_right = input.chunk(2, dim=-1)
+#
+#         # 对右半部分先做归一化，再送入状态空间注意力模块，并应用 DropPath
+#         x = self.drop_path(self.self_attention(self.ln_1(input_right)))
+#
+#         # 对左半部分做局部卷积处理
+#         input_left = input_left.permute(0, 3, 1, 2).contiguous()  # 调整维度为 [B, C, H, W]
+#         input_left = self.conv33conv33conv11(input_left)  # 卷积序列处理
+#         input_left = input_left.permute(0, 2, 3, 1).contiguous()  # 调整回原始维度顺序 [B, H, W, C]
+#
+#         # 将两部分重新拼接
+#         output = torch.cat((input_left, x), dim=-1)
+#
+#         # 通道混洗（增强特征交互）
+#         output = channel_shuffle(output, groups=2)
+#
+#         # 残差连接，返回处理结果
+#         return output + input
 
 class SS_Conv_SSM(nn.Module):
     def __init__(
@@ -629,54 +686,51 @@ class SS_Conv_SSM(nn.Module):
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         attn_drop_rate: float = 0,
         d_state: int = 16,
+        # 新增的轻量化开关（保持向下兼容）
+        attn_ratio: float = 0.5,   # 走 SS2D 的通道占比
+        use_dw: bool = True,        # 卷积路是否用深度可分离
         **kwargs,
     ):
         super().__init__()
-        # 对输入右半部分特征做 LayerNorm
-        self.ln_1 = norm_layer(hidden_dim // 2)
+        C = hidden_dim
+        # 通道划分：一部分走 SS2D，其余走卷积
+        self.c_attn = max(1, int(C * attn_ratio))
+        self.c_conv = C - self.c_attn
 
-        # 空间状态建模模块（SS2D），类似注意力机制的操作
-        self.self_attention = SS2D(d_model=hidden_dim // 2, dropout=attn_drop_rate, d_state=d_state, **kwargs)
+        # --- SS2D 路（保持变量名兼容：ln_1 / self_attention）---
+        self.ln_1 = norm_layer(self.c_attn)
+        self.self_attention = SS2D(d_model=self.c_attn, dropout=attn_drop_rate, d_state=d_state, **kwargs)
 
-        # DropPath，用于实现随机深度（Stochastic Depth）
-        self.drop_path = DropPath(drop_path)
-
-        # 左半部分使用一组卷积模块进行局部建模：3x3 -> 3x3 -> 1x1
+        # --- 卷积路（DW3×3 + PW1×1；保持变量名兼容：conv33conv33conv11）---
+        groups = self.c_conv if use_dw else 1
         self.conv33conv33conv11 = nn.Sequential(
-            nn.BatchNorm2d(hidden_dim // 2),  # 批归一化
-            nn.Conv2d(in_channels=hidden_dim // 2, out_channels=hidden_dim // 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=hidden_dim // 2, out_channels=hidden_dim // 2, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(in_channels=hidden_dim // 2, out_channels=hidden_dim // 2, kernel_size=1, stride=1),
-            nn.ReLU()
+            nn.BatchNorm2d(self.c_conv),
+            nn.Conv2d(self.c_conv, self.c_conv, kernel_size=3, stride=1, padding=1, groups=groups, bias=False),
+            nn.BatchNorm2d(self.c_conv),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(self.c_conv, self.c_conv, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(self.c_conv),
+            nn.SiLU(inplace=True),
         )
 
-        # 下面是注释掉的最终 1x1 卷积（未使用）
-        # self.finalconv11 = nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1)
+        self.drop_path = DropPath(drop_path)
 
-    def forward(self, input: torch.Tensor):
-        # 将输入在最后一维平均分为左右两部分
-        input_left, input_right = input.chunk(2, dim=-1)
+    def forward(self, x: torch.Tensor):  # x: [B,H,W,C]
+        # 先把“卷积通道”与“SS2D通道”分开（保持总维度不变）
+        x_conv, x_attn = torch.split(x, [self.c_conv, self.c_attn], dim=-1)
 
-        # 对右半部分先做归一化，再送入状态空间注意力模块，并应用 DropPath
-        x = self.drop_path(self.self_attention(self.ln_1(input_right)))
+        # SS2D 路（NHWC）
+        y_attn = self.drop_path(self.self_attention(self.ln_1(x_attn)))  # [B,H,W,c_attn]
 
-        # 对左半部分做局部卷积处理
-        input_left = input_left.permute(0, 3, 1, 2).contiguous()  # 调整维度为 [B, C, H, W]
-        input_left = self.conv33conv33conv11(input_left)  # 卷积序列处理
-        input_left = input_left.permute(0, 2, 3, 1).contiguous()  # 调整回原始维度顺序 [B, H, W, C]
+        # 卷积路（NCHW→NHWC）
+        y_conv = x_conv.permute(0, 3, 1, 2).contiguous()
+        y_conv = self.conv33conv33conv11(y_conv)
+        y_conv = y_conv.permute(0, 2, 3, 1).contiguous()                 # [B,H,W,c_conv]
 
-        # 将两部分重新拼接
-        output = torch.cat((input_left, x), dim=-1)
-
-        # 通道混洗（增强特征交互）
-        output = channel_shuffle(output, groups=2)
-
-        # 残差连接，返回处理结果
-        return output + input
+        # 拼接回去（卷积在前、SS2D在后），可与后续 channel_shuffle 无缝衔接
+        y = torch.cat([y_conv, y_attn], dim=-1)                          # [B,H,W,C]
+        y = channel_shuffle(y, groups=2)
+        return x + y
 
 
 
@@ -1049,8 +1103,7 @@ class DualBranchVSSMEnhanced(nn.Module):
     def forward_backbone(self, x):
         # x: [B, C, H, W]
         # —— 先生成各阶段的边缘特征 ——
-        with torch.no_grad():
-            edge_feats = self.edge_generator(x)
+        edge_feats = self.edge_generator(x)
         # —— 主干 forward ——
         x = self.patch_embed(x)      # [B, H/ps, W/ps, dims[0]]
         x = self.pos_drop(x)

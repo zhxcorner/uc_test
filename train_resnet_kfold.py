@@ -59,8 +59,22 @@ def build_model(model_name: str, num_classes: int = 2):
     - Swin: swin_t, swin_s, swin_b
     """
     from torchvision import models as tvm
+    # --- MedViT (s/b/l) from local MedViT.py ---
+    if model_name in {'medvit_s', 'medvit_b', 'medvit_l'}:
+        try:
+            from MedViT import MedViT_small, MedViT_base, MedViT_large
+        except Exception:
+            sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+            from MedViT import MedViT_small, MedViT_base, MedViT_large
 
-    # --- ViT(t/s/b) 用 timm，避免手动改 classifier ---
+        if model_name == 'medvit_s':
+            return MedViT_small(num_classes=num_classes)
+        elif model_name == 'medvit_b':
+            return MedViT_base(num_classes=num_classes)
+        else:  # 'medvit_l'
+            return MedViT_large(num_classes=num_classes)
+
+    # --- ViT(t/s/b) 用 timm，避免手动改 classifier34 ---
     TIMM_VIT_NAMES = {
         'vit_t': 'vit_tiny_patch16_224',
         'vit_s': 'vit_small_patch16_224',
@@ -123,23 +137,20 @@ def build_model(model_name: str, num_classes: int = 2):
                 in_features = last.in_features
                 model.classifier[-1] = nn.Linear(in_features, num_classes)
             else:
-                # 兜底：直接替换整个 classifier
                 in_features = getattr(last, 'in_features', None)
                 if in_features is None and hasattr(model, 'num_features'):
                     in_features = model.num_features
                 if in_features is None:
                     raise NotImplementedError(f"无法确定 {model_name} 的分类头输入维度")
                 model.classifier = nn.Sequential(nn.Flatten(), nn.Linear(in_features, num_classes))
-        else:
-            # DenseNet: classifier 是 Linear
-            if isinstance(model.classifier, nn.Linear):
-                in_features = model.classifier.in_features
-                model.classifier = nn.Linear(in_features, num_classes)
-            else:
-                raise NotImplementedError(f"未实现 {model_name} 的 classifier 替换")
+
+    elif hasattr(model, 'head') and isinstance(model.head, nn.Linear):
+        # 🔧 Swin（torchvision 的 SwinTransformer 使用 model.head 作为分类头）
+        in_features = model.head.in_features
+        model.head = nn.Linear(in_features, num_classes)
 
     elif hasattr(model, 'heads') and hasattr(model.heads, 'head'):
-        # Swin（torchvision）
+        # ViT（torchvision 的 VisionTransformer：heads.head）
         in_features = model.heads.head.in_features
         model.heads.head = nn.Linear(in_features, num_classes)
 
@@ -238,6 +249,8 @@ def main():
             'vit_t', 'vit_s', 'vit_b',
             # Swin
             'swin_t', 'swin_s', 'swin_b',
+            # MedViT
+            'medvit_s', 'medvit_b', 'medvit_l',
         ],
         help="选择模型（默认 resnet34）"
     )
